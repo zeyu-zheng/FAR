@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.env
+
+# Data and run outputs -- never committed
+data/*
+!data/.gitkeep
+*.jsonl
+*.parquet
+*.candidates
+*.log
+
+# Agent workspaces
+.far/
+.opencode/
+
+# Local/editor
+.DS_Store
+.vscode/
+.idea/
