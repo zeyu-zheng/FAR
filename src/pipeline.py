@@ -155,38 +155,71 @@ def run_pool(
     ramp_delay: float,
     stop_event: threading.Event,
 ) -> None:
-    """Run a bounded future pool, ramping only its initial worker launch."""
-    task_iter = iter(tasks)
+    """Run a bounded pool without blocking result collection on upstream input.
+
+    A dedicated producer may block while waiting for an upstream stage. The main
+    thread remains free to reap completed futures immediately, so streaming
+    stages do not wait for a full batch of ``jobs`` tasks before forwarding
+    results downstream.
+    """
+    task_queue: queue.Queue = queue.Queue(maxsize=max(jobs * 2, 1))
+    producer_done = threading.Event()
+    producer_errors: list[BaseException] = []
+
+    def produce() -> None:
+        try:
+            for task in tasks:
+                while not stop_event.is_set():
+                    try:
+                        task_queue.put(task, timeout=0.5)
+                        break
+                    except queue.Full:
+                        continue
+                if stop_event.is_set():
+                    return
+        except BaseException as exc:  # noqa: BLE001 - surface iterator failures
+            producer_errors.append(exc)
+            stop_event.set()
+        finally:
+            producer_done.set()
+
+    producer = threading.Thread(target=produce, name="stage-input", daemon=True)
+    producer.start()
     pending: set[concurrent.futures.Future] = set()
-    exhausted = False
     launched = 0
 
     with ThreadPoolExecutor(max_workers=jobs) as executor:
-        while pending or not exhausted:
+        while pending or not producer_done.is_set() or not task_queue.empty():
+            if producer_errors:
+                raise producer_errors[0]
             if stop_event.is_set():
                 for future in pending:
                     future.cancel()
                 return
 
-            while len(pending) < jobs and not exhausted and not stop_event.is_set():
-                task = next(task_iter, _SENTINEL)
-                if task is _SENTINEL:
-                    exhausted = True
+            while len(pending) < jobs:
+                try:
+                    task = task_queue.get_nowait()
+                except queue.Empty:
                     break
                 if ramp_delay and launched and launched < jobs:
                     time.sleep(ramp_delay)
                 pending.add(submit(executor, task))
                 launched += 1
 
-            if not pending:
-                continue
+            if pending:
+                done, _ = concurrent.futures.wait(
+                    pending, timeout=0.5, return_when=concurrent.futures.FIRST_COMPLETED
+                )
+                for future in done:
+                    pending.remove(future)
+                    handle_done(future)
+            elif not producer_done.is_set():
+                producer_done.wait(0.1)
 
-            done, _ = concurrent.futures.wait(
-                pending, timeout=0.5, return_when=concurrent.futures.FIRST_COMPLETED
-            )
-            for future in done:
-                pending.remove(future)
-                handle_done(future)
+    producer.join(timeout=1)
+    if producer_errors:
+        raise producer_errors[0]
 
 
 # ── Run context ─────────────────────────────────────────────────────────────
@@ -226,7 +259,8 @@ class Context:
             if self.args.resume:
                 for item in iter_jsonl(self.output_path(stage)):
                     try:
-                        keys.add(done_key(stage, item))
+                        if record_matches_current_schema(stage, item):
+                            keys.add(done_key(stage, item))
                     except Exception:
                         continue
             self._done[stage] = keys
@@ -276,6 +310,29 @@ class Context:
         self.stats.bump(stage, "fail")
         print(f"[{stage}] failed {key}: {last_error}", flush=True)
         return None
+
+
+def input_matches_current_schema(stage: str, item: dict[str, Any]) -> bool:
+    """Reject persisted upstream records that should not feed this stage."""
+    if stage == "judge":
+        return not bool(item.get("solve_error"))
+    if stage == "grade":
+        return not bool(item.get("judge_error"))
+    return True
+
+
+def record_matches_current_schema(stage: str, item: dict[str, Any]) -> bool:
+    """Return whether a persisted record is complete enough to resume from.
+
+    Infrastructure failures are diagnostic records, not completed work. If an
+    agent call crashed, a later resumed run should try that item again instead
+    of treating the failure record as final.
+    """
+    if stage == "judge":
+        return not bool(item.get("judge_error"))
+    if stage == "grade":
+        return item.get("quality") != "error"
+    return True
 
 
 def done_key(stage: str, item: dict[str, Any]):
@@ -348,6 +405,8 @@ def stage_input(
         if in_queue is not None and not ctx.args.resume:
             return
         for item in iter_jsonl(ctx.source_path(stage)):
+            if not input_matches_current_schema(stage, item):
+                continue
             if keep is None or keep(item):
                 yield from expand(item) if expand else [item]
 

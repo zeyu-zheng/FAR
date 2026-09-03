@@ -66,9 +66,11 @@ def judge_one(
                 stop_event,
             )
             verdict = parse_first_word(judge_text, JUDGE_WORDS, "FAIL")
+            judge_error = False
         except Exception as exc:
             verdict = "FAIL"
             judge_text = f"FAIL\nJudge {judge_id} failed: {exc}"
+            judge_error = True
         duration = time.time() - judge_started_at
         trace_path = work_dir / f"judge_{judge_id:02d}.md"
         trace_path.write_text(judge_text, encoding="utf-8")
@@ -78,6 +80,7 @@ def judge_one(
                 "verdict": verdict,
                 "duration": round(duration, 3),
                 "judgement": judge_text,
+                "error": judge_error,
                 "trace_path": str(trace_path),
             }
         )
@@ -99,6 +102,7 @@ def judge_one(
         "verdict": verdict,
         "judgement": judgement,
         "judge_results": judge_results,
+        "judge_error": any(result.get("error") for result in judge_results),
         "result": classify_result(item.get("source", "NONE"), verdict),
         "work_dir": str(work_dir),
         "judge_duration": round(time.time() - started_at, 3),
