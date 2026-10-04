@@ -29,17 +29,10 @@ import threading
 from pathlib import Path
 from typing import Any
 
-from src.prompts import (
-    GRADER_AGENT_FRONTMATTER,
-    GRADER_SYSTEM_PROMPT,
-    JUDGE_AGENT_FRONTMATTER,
-    JUDGE_SYSTEM_PROMPT,
-    PROVER_AGENT_FRONTMATTER,
-    PROVER_SYSTEM_PROMPT,
-)
 from src.utils import PipelineCancelled, check_cancelled, wait_retry
 
 RETRY_SLEEP = 60
+AGENT_CONFIG_DIR = Path(__file__).resolve().parent.parent
 
 PROVER_AGENT = "prover"
 JUDGE_AGENT = "judge"
@@ -153,29 +146,28 @@ def require_opencode() -> None:
         )
 
 
-def install_opencode_agents() -> None:
-    agent_dir = Path(".opencode/agents")
-    agent_dir.mkdir(parents=True, exist_ok=True)
-    for name, frontmatter, system_prompt in (
-        (PROVER_AGENT, PROVER_AGENT_FRONTMATTER, PROVER_SYSTEM_PROMPT),
-        (JUDGE_AGENT, JUDGE_AGENT_FRONTMATTER, JUDGE_SYSTEM_PROMPT),
-        (GRADER_AGENT, GRADER_AGENT_FRONTMATTER, GRADER_SYSTEM_PROMPT),
-    ):
-        definition = f"{frontmatter.strip()}\n\n{system_prompt.strip()}\n"
-        (agent_dir / f"{name}.md").write_text(definition, encoding="utf-8")
-
-
 def opencode_model(model: str) -> str:
     if "/" in model:
         return model
     return f"openai/{model}"
 
 
-def run_opencode_command(command: list[str], stop_event: threading.Event | None) -> tuple[int, str]:
+def run_opencode_command(
+    command: list[str], stop_event: threading.Event | None, work_dir: Path
+) -> tuple[int, str]:
     """Run opencode on a pty and stream its output, honouring cancellation."""
     master, slave = pty.openpty()
     output = bytearray()
-    proc = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=slave, stderr=slave, close_fds=True)
+    env = {**os.environ, "OPENCODE_CONFIG_DIR": str(AGENT_CONFIG_DIR)}
+    proc = subprocess.Popen(
+        command,
+        cwd=work_dir,
+        env=env,
+        stdin=subprocess.DEVNULL,
+        stdout=slave,
+        stderr=slave,
+        close_fds=True,
+    )
     os.close(slave)
     cancelled = False
     try:
@@ -232,15 +224,14 @@ def run_agent(
     for attempt in range(1, retries + 2):
         check_cancelled(stop_event)
         try:
+            model_id = opencode_model(model)
             command = [
                 "opencode",
                 "run",
                 "--format",
                 "json",
                 "--model",
-                opencode_model(model),
-                "--dir",
-                str(work_dir),
+                model_id,
                 "--agent",
                 agent,
             ]
@@ -249,7 +240,7 @@ def run_agent(
             command.append(message)
             for path in attachments:
                 command.extend(["--file", str(path.resolve())])
-            returncode, output = run_opencode_command(command, stop_event)
+            returncode, output = run_opencode_command(command, stop_event, work_dir)
             if returncode != 0:
                 raise RuntimeError(output.strip())
             parts = []

@@ -96,8 +96,10 @@ The code uses the names from the paper.
 | Recommend, "Judging" | `src/judge.py` | `data/judged.jsonl` |
 | Recommend, "Recommending for review" | `src/grade.py` | `data/graded.jsonl` |
 
-Prompts for all six are in `src/prompts.py`, in pipeline order, matching
-appendix A of the paper. Output schemas and validators are in `src/schemas.py`.
+Find prompts and per-task agent messages are in `src/prompts.py`. Solve, Judge,
+and Grade system prompts are maintained directly in `agents/prover.md`,
+`judge.md`, and `grader.md`, matching appendix A of the paper. Output schemas
+and validators are in `src/schemas.py`.
 
 ### The research direction
 
@@ -120,6 +122,10 @@ the script you are running, or pass it directly:
 ```bash
 python src/pipeline.py --stage all --corpus /path/to/corpus.arrow
 ```
+
+For debugging, `data/debug.arrow` contains the extracted full text of
+20 real arXiv mathematics papers. Pass `--corpus data/debug.arrow`
+and `--direction combinatorics` to use it.
 
 ## Setup
 
@@ -145,7 +151,8 @@ export CHECK_API_KEY=...      CHECK_BASE_URL=...
 
 Solve, Judge, and Grade run through the [`opencode`](https://opencode.ai) CLI,
 which manages its own credentials.
-Install it using the [official instructions](https://opencode.ai/download) and
+Use OpenCode 1.18.32. Install it using the
+[official instructions](https://opencode.ai/download) and
 ensure it is on `PATH`. It can be replaced by any other agent backbone — Codex,
 Claude Code, Cursor — by editing `src/agent.py`.
 
@@ -195,8 +202,9 @@ conjecture.
 
 ```bibtex
 @article{zheng2026problem,
-  title={The Problem Is the Problem: Towards Scalable Mathematical Discovery},
+  title={The problem is the problem: Towards scalable mathematical discovery},
   author={Zheng, Zeyu and Zhang, Shengtong and Avigad, Jeremy and Tetali, Prasad and Welleck, Sean},
+  journal={arXiv preprint arXiv:2608.16977},
   year={2026}
 }
 ```

@@ -4,9 +4,10 @@ __pycache__/
 .venv/
 .env
 
-# Data and run outputs -- never committed
+# Data and run outputs, except the fixed debug corpus
 data/*
 !data/.gitkeep
+!data/debug.arrow
 *.jsonl
 *.parquet
 *.candidates
@@ -15,8 +16,11 @@ data/*
 # Agent workspaces
 .far/
 .opencode/
+opencode.json
+opencode.jsonc
 
 # Local/editor
+DEVELOPMENT_PLAN.md
 .DS_Store
 .vscode/
 .idea/

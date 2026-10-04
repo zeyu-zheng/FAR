@@ -39,7 +39,7 @@ from src import grade as grade_stage
 from src import judge as judge_stage
 from src import label as label_stage
 from src import solve as solve_stage
-from src.agent import format_elapsed, install_opencode_agents, require_opencode, result_key
+from src.agent import format_elapsed, require_opencode, result_key
 from src.reader import Corpus, iter_rows
 from src.utils import (
     HTTP_RETRIES,
@@ -662,7 +662,6 @@ def preflight(args: argparse.Namespace, stages: tuple[str, ...]) -> None:
                 require_env(name)
     if any(stage in AGENT_STAGES for stage in stages):
         require_opencode()
-        install_opencode_agents()
 
 
 def main() -> None:
