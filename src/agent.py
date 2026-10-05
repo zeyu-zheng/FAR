@@ -143,22 +143,6 @@ def prepare_work_dir(task: dict[str, Any], body: str, work_root: Path) -> Path:
 # ── opencode backend ────────────────────────────────────────────────────────
 
 
-def opencode_model(model: str) -> str:
-    if "/" in model:
-        return model
-    return f"openai/{model}"
-
-
-def opencode_command(model_id: str, effort: str | None, agent: str, message: str, files: list[str]) -> list[str]:
-    command = ["opencode", "run", "--format", "json", "--model", model_id, "--agent", agent]
-    if effort:
-        command.extend(["--variant", effort])
-    command.append(message)
-    for path in files:
-        command.extend(["--file", path])
-    return command
-
-
 class OpencodeOutput:
     """Reads opencode's JSON event stream as it arrives.
 
@@ -227,11 +211,6 @@ def pump(runtime, call, log, output: OpencodeOutput, stop_event: threading.Event
     return False
 
 
-def next_attempt(stage_dir: Path) -> int:
-    numbers = [int(p.stem[7:]) for p in stage_dir.glob("output_*.log") if p.stem[7:].isdigit()]
-    return max(numbers, default=0) + 1
-
-
 def reset_workspace(stage_dir: Path, inputs: list[Path]) -> Path:
     """Empty the workspace and copy in this stage's inputs, read-only."""
     workspace = stage_dir / "workspace"
@@ -265,7 +244,8 @@ def run_attempt(
     stop_event: threading.Event | None,
 ) -> str:
     """One opencode call: fresh workspace, one output log, one session export."""
-    number = next_attempt(stage_dir)
+    numbers = [int(p.stem[7:]) for p in stage_dir.glob("output_*.log") if p.stem[7:].isdigit()]
+    number = max(numbers, default=0) + 1
     log_path = stage_dir / f"output_{number:03d}.log"
     session_path = stage_dir / f"session_{number:03d}.json"
     state = stage_dir / ".opencode" / f"{number:03d}"
@@ -277,9 +257,12 @@ def run_attempt(
         host_log(log, f"attempt {number:03d} mode={runtime.mode} agent={agent} model={model_id} variant={effort or '-'}")
         try:
             workspace = reset_workspace(stage_dir, inputs)
-            command = opencode_command(
-                model_id, effort, agent, message, [runtime.path(workspace / path.name) for path in inputs]
-            )
+            command = ["opencode", "run", "--format", "json", "--model", model_id, "--agent", agent]
+            if effort:
+                command += ["--variant", effort]
+            command.append(message)
+            for path in inputs:
+                command += ["--file", runtime.path(workspace / path.name)]
             check_cancelled(stop_event)
             call = runtime.start(command, workspace, state, inputs, model_id, log)
             try:
@@ -307,27 +290,19 @@ def run_attempt(
             raise
         if cancelled:
             raise PipelineCancelled("pipeline cancelled")
-        try:
-            return final_text(output, code, problem, expected_first_words, log_path)
-        except RuntimeError as exc:
-            # Recorded in this attempt's log, so a retry's reason is not lost.
-            host_log(log, f"rejected: {exc}")
-            raise
-
-
-def final_text(
-    output: OpencodeOutput, code: int, problem: str, expected_first_words: set[str], log_path: Path
-) -> str:
-    """The agent's answer, or why the attempt does not count."""
-    if code != 0 or problem:
-        details = " | ".join(output.tail)[-2000:]
-        raise RuntimeError(f"opencode exited with {code}{', ' + problem if problem else ''} ({log_path}): {details}")
-    text = select_expected_output(output.texts, expected_first_words)
-    if not text:
-        raise RuntimeError(f"empty opencode output ({log_path})")
-    if parse_first_word(text, expected_first_words, "") == "":
-        raise RuntimeError(f"unexpected first word in opencode output: {text.splitlines()[0][:80]}")
-    return text
+        text = select_expected_output(output.texts, expected_first_words)
+        if code != 0 or problem:
+            details = " | ".join(output.tail)[-2000:]
+            rejected = f"opencode exited with {code}{', ' + problem if problem else ''} ({log_path}): {details}"
+        elif not text:
+            rejected = f"empty opencode output ({log_path})"
+        elif parse_first_word(text, expected_first_words, "") == "":
+            rejected = f"unexpected first word in opencode output: {text.splitlines()[0][:80]}"
+        else:
+            return text
+        # Recorded in this attempt's log, so a retry's reason is not lost.
+        host_log(log, f"rejected: {rejected}")
+        raise RuntimeError(rejected)
 
 
 def run_agent(
@@ -349,7 +324,7 @@ def run_agent(
         check_cancelled(stop_event)
         try:
             return run_attempt(
-                runtime, opencode_model(model), effort, agent, message,
+                runtime, model if "/" in model else f"openai/{model}", effort, agent, message,
                 stage_dir, inputs, expected_first_words, stop_event,
             )  # fmt: skip
         except PipelineCancelled:

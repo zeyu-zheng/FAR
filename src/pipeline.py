@@ -41,7 +41,7 @@ from src import judge as judge_stage
 from src import label as label_stage
 from src import solve as solve_stage
 from src.agent import format_elapsed, result_key
-from src.runtime import make_runtime
+from src.runtime import DockerRuntime, LocalRuntime
 from src.reader import Corpus, iter_rows
 from src.utils import (
     HTTP_RETRIES,
@@ -673,7 +673,7 @@ def preflight(ctx: "Context", stages: tuple[str, ...]) -> None:
             for name in STAGE_ENV[stage]:
                 require_env(name)
     if any(stage in AGENT_STAGES for stage in stages):
-        ctx.runtime = make_runtime(args)
+        ctx.runtime = DockerRuntime() if args.mode == "docker" else LocalRuntime()
         ctx.runtime.recover()
 
 
