@@ -10,7 +10,7 @@ outcome:
            proposes cannot be settled
     NONE   none of the above
 
-Only NEW outcomes go on to Judge.
+KNOWN and NEW outcomes go on to Judge.
 
 Runs the most capable model in the pipeline: Find has narrowed the pool, so
 this stage can afford more compute per item.
@@ -68,7 +68,7 @@ def solve_one(
 
     return {
         # Carried forward so Judge and Grade can rebuild an identical workspace
-        # without re-running this stage. See agent.TASK_KEYS.
+        # without re-running this stage.
         **task,
         "source": source,
         "solution": solution,

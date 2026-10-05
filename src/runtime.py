@@ -358,8 +358,8 @@ def _copy_in(container: str, source: Path) -> None:
     _finish(proc, "copy into container")
 
 
-def _copy_out(container: str, script: str, target: Path) -> None:
-    """Unpack the tar stream `script` writes into `target`, as the host user.
+def _copy_out(container: str, target: Path) -> None:
+    """Copy the container's workspace into `target`, as the host user.
 
     Whatever the agent left that would reach outside `target`, through a link
     or an absolute name, is skipped; everything else still comes out.
@@ -372,7 +372,7 @@ def _copy_out(container: str, script: str, target: Path) -> None:
             return None
 
     target.mkdir(parents=True, exist_ok=True)
-    proc = _exec_stream(container, script)
+    proc = _exec_stream(container, "tar -c .")
     with tarfile.open(fileobj=proc.stdout, mode="r|") as archive:
         archive.extractall(target, filter=safe)
     proc.stdout.read()  # the archive's trailing padding
@@ -451,7 +451,7 @@ class DockerRuntime:
             # Whatever the agent left running in the background goes first.
             self.stop(call)
             shutil.rmtree(call.workspace)
-            _copy_out(call.container, "tar -c .", call.workspace)
+            _copy_out(call.container, call.workspace)
         finally:
             _docker("rm", "-f", call.container)
 

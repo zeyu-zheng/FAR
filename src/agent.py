@@ -46,28 +46,13 @@ GRADER_AGENT = "grader"
 # First-line tokens each agent is required to emit.
 SOURCE_WORDS = {"KNOWN", "NEW", "FIX", "NONE"}
 JUDGE_WORDS = {"PASS", "FAIL", "KNOWN"}
-QUALITY_WORDS = {"KNOWN", "TYPE1", "TYPE2", "TYPE3"}
 QUALITY_LABELS = {"KNOWN": "known", "TYPE1": "type1", "TYPE2": "type2", "TYPE3": "type3"}
+QUALITY_WORDS = set(QUALITY_LABELS)
 
 
 # ── Workspace ───────────────────────────────────────────────────────────────
 
-# Keys of a task record that input.json is built from, plus the two that
-# identify it. Any stage that persists a record which a later stage may re-open
-# must carry all of these.
-TASK_KEYS = (
-    "row_index",
-    "candidate_index",
-    "title",
-    "authors",
-    "conjecture_label",
-    "conjecture_section",
-    "conjecture_text",
-    "sources",
-)
-
-
-def write_input_json(task: dict[str, Any], body: str, work_dir: Path) -> Path:
+def write_input_json(task: dict[str, Any], body: str, work_dir: Path) -> None:
     """Write the agent-visible input.json.
 
     Only what an agent can act on. Check's `importance` and `difficulty` are
@@ -97,21 +82,6 @@ def write_input_json(task: dict[str, Any], body: str, work_dir: Path) -> Path:
         ),
         encoding="utf-8",
     )
-    return path
-
-
-def task_from_record(item: dict[str, Any]) -> dict[str, Any]:
-    """Recover the task fields from a persisted stage record.
-
-    Lets Judge and Grade rebuild a workspace identical to the one Solve used,
-    without re-running the earlier stage.
-    """
-    return {key: item.get(key) for key in TASK_KEYS}
-
-
-def work_name_for(task: dict[str, Any]) -> str:
-    row, candidate = result_key(task)
-    return f"row_{row}_candidate_{candidate}"
 
 
 def restore_workspace(item: dict[str, Any], body: str, work_root: Path) -> Path:
@@ -122,7 +92,10 @@ def restore_workspace(item: dict[str, Any], body: str, work_root: Path) -> Path:
     that has been judged carries a judgement, which is what decides whether
     judge.md is there for the grader to read.
     """
-    work_dir = prepare_work_dir(task_from_record(item), body, work_root)
+    # Older records may omit fields that the input writer indexes directly.
+    task = dict.fromkeys(("row_index", "candidate_index", "title", "authors", "conjecture_text"))
+    task.update(item)
+    work_dir = prepare_work_dir(task, body, work_root)
     (work_dir / "solution.md").write_text(
         str(item.get("solution") or "").strip() or "(no solution)", encoding="utf-8"
     )
@@ -134,7 +107,8 @@ def restore_workspace(item: dict[str, Any], body: str, work_root: Path) -> Path:
 
 
 def prepare_work_dir(task: dict[str, Any], body: str, work_root: Path) -> Path:
-    work_dir = (work_root / work_name_for(task)).resolve()
+    row, candidate = result_key(task)
+    work_dir = (work_root / f"row_{row}_candidate_{candidate}").resolve()
     work_dir.mkdir(parents=True, exist_ok=True)
     write_input_json(task, body, work_dir)
     return work_dir

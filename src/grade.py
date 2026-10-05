@@ -64,7 +64,7 @@ def grade_one(
             stop_event,
         )
         quality_word = parse_first_word(grade_text, QUALITY_WORDS, "")
-        quality = QUALITY_LABELS.get(quality_word, "ungraded")
+        quality = QUALITY_LABELS[quality_word]
     except PipelineCancelled:
         raise
     except Exception as exc:  # noqa: BLE001 - record grader failure for manual triage

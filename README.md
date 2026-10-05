@@ -18,7 +18,7 @@ FAR: Find, Attempt, and Recommend
 
 <div align="center" style="line-height: 1;">
   <a href="https://arxiv.org/abs/2608.16977"><img src="https://img.shields.io/badge/arXiv-2608.16977-b31b1b.svg?style=flat-square&labelColor=000000"></a>
-  <a href="https://probxiv.com"><img src="https://img.shields.io/badge/Forum-ProbXiv.com-007BC0?style=flat-square&labelColor=000000"></a>
+  <a href="https://probxiv.com"><img src="https://img.shields.io/badge/Forum-ProbXiv.com-C41230?style=flat-square&labelColor=000000"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache%202.0-6D6E71.svg?style=flat-square&labelColor=000000"></a>
 </div>
 
