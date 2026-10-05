@@ -248,8 +248,6 @@ def run_attempt(
     number = max(numbers, default=0) + 1
     log_path = stage_dir / f"output_{number:03d}.log"
     session_path = stage_dir / f"session_{number:03d}.json"
-    state = stage_dir / ".opencode" / f"{number:03d}"
-    state.mkdir(parents=True, exist_ok=True)
     output = OpencodeOutput()
     cancelled = False
     code, problem = 1, "call did not finish"
@@ -262,9 +260,9 @@ def run_attempt(
                 command += ["--variant", effort]
             command.append(message)
             for path in inputs:
-                command += ["--file", runtime.path(workspace / path.name)]
+                command += ["--file", path.name]  # opencode runs in the workspace
             check_cancelled(stop_event)
-            call = runtime.start(command, workspace, state, inputs, model_id, log)
+            call = runtime.start(command, workspace, model_id, log)
             try:
                 cancelled = pump(runtime, call, log, output, stop_event)
             finally:
@@ -275,12 +273,12 @@ def run_attempt(
                     if call.proc.poll() is None or cancelled:
                         runtime.stop(call)
                         pump(runtime, call, log, output, None, deadline=time.monotonic() + 5)
-                    code, problem = runtime.status(call)
+                    code, problem = call.proc.wait(), ""
                 except Exception as exc:
                     problem = f"finish failed: {exc}"
                     host_log(log, problem)
                 host_log(log, f"{'cancelled, ' if cancelled else ''}exit code {code} {problem}".rstrip())
-                save_session(runtime, state, output.session_id, session_path, log)
+                save_session(runtime, call, output.session_id, session_path, log)
                 try:
                     runtime.cleanup(call)
                 except Exception as exc:
@@ -324,7 +322,7 @@ def run_agent(
         check_cancelled(stop_event)
         try:
             return run_attempt(
-                runtime, model if "/" in model else f"openai/{model}", effort, agent, message,
+                runtime, model, effort, agent, message,
                 stage_dir, inputs, expected_first_words, stop_event,
             )  # fmt: skip
         except PipelineCancelled:
@@ -394,14 +392,3 @@ def result_key(item: dict[str, Any]) -> tuple[int, int]:
     runs.
     """
     return (int(item["row_index"]), int(item["candidate_index"]))
-
-
-def format_elapsed(seconds: float) -> str:
-    total = int(round(seconds))
-    hours, remainder = divmod(total, 3600)
-    minutes, secs = divmod(remainder, 60)
-    if hours:
-        return f"{hours}h {minutes}m {secs}s"
-    if minutes:
-        return f"{minutes}m {secs}s"
-    return f"{secs}s"

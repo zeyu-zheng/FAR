@@ -1,16 +1,12 @@
 """Where an opencode agent runs: on this machine, or in a Docker container.
 
-Both runtimes take the same opencode command line and the same per-attempt
-directories, and differ only in how the process is started, stopped, and read
-back:
-
-    <stage_dir>/workspace/          the agent's working directory (/workspace in Docker)
-    <stage_dir>/.opencode/NNN/      opencode's own store for attempt NNN
-
-The store holds the session database (with its WAL and attachments) and outlives
-the process or container, so a session can be exported after a crash or a
-cancel. Credentials never go into it: the selected provider's entry is passed
-through OPENCODE_AUTH_CONTENT, and any auth.json opencode writes is removed.
+Both runtimes take the same opencode command line and the same workspace,
+<stage_dir>/workspace/, and differ only in how the process is started,
+stopped, and read back. A local opencode keeps its sessions where it always
+does; a container mounts nothing from the host, so its workspace is copied out
+of it at the end (see DockerRuntime). Either way, each session is exported to
+session_NNN.json. Model credentials reach opencode only as environment
+variables.
 
 Every attempt is tagged with its owner, `<host>:<pid>` of this FAR process: a
 container through its labels, a local attempt through the FAR_CALL variable
@@ -29,6 +25,7 @@ import shutil
 import signal
 import socket
 import subprocess
+import tarfile
 import threading
 import time
 import uuid
@@ -43,13 +40,11 @@ AGENTS_DIR = Path(__file__).resolve().parent.parent / "agents"
 
 # Docker's OpenCode sandbox template; 0.7.0 ships OpenCode 1.18.32.
 DOCKER_IMAGE = "docker/sandbox-templates:opencode-0.7.0"
-CONTAINER_WORKSPACE = "/workspace"
-# Containers run as the host user, who has no home in the image: the agent
-# gets one under its store, and the session data is mounted on its own. Both
-# live under /tmp, where that user can create them when nothing is mounted.
-CONTAINER_HOME = "/tmp/far/home"
-CONTAINER_DATA = "/tmp/far/data"
-CONTAINER_LIMITS = ["--cpus", "2", "--memory", "4g", "--memory-swap", "4g", "--pids-limit", "1024"]
+# An idle container stops by itself after this, whatever happened to FAR.
+CONTAINER_LIFETIME = "12h"
+
+# How long a stopped agent gets to exit on SIGTERM before SIGKILL.
+STOP_GRACE = 10
 
 # Pinned behaviour in both modes: no self-update, no external plugins, and no
 # project or Claude Code configuration picked up from around the workspace.
@@ -62,8 +57,8 @@ OPENCODE_ENV = {
 TAG_VAR = "FAR_CALL"
 
 
-def process_owner() -> str:
-    return f"{socket.gethostname()}:{os.getpid()}"
+# This FAR process, as `<host>:<pid>`.
+OWNER = f"{socket.gethostname()}:{os.getpid()}"
 
 
 def owner_gone(owner: str) -> bool:
@@ -79,76 +74,36 @@ def host_log(log: IO[bytes], message: str) -> None:
     log.write(f"\n[far] {time.strftime('%Y-%m-%dT%H:%M:%S')} {message}\n".encode())
 
 
-def save_session(runtime: Any, state: Path, session_id: str | None, path: Path, log: IO[bytes]) -> None:
-    """Export one attempt's native session next to its output log.
+def save_session(runtime: Any, call: "Call", session_id: str | None, path: Path, log: IO[bytes]) -> None:
+    """Export one attempt's native session to `path`, next to its output log.
 
-    A missing or unreadable export is recorded, never papered over: the store
-    under `state` is kept either way and can be exported again by hand.
+    opencode exits before a pipe drains, cutting its stdout at 64 KiB, so the
+    export is written to a file, never piped. One that does not parse is
+    removed and recorded as an error; the answer stands.
     """
     if not session_id:
         host_log(log, "session not exported: opencode reported no session id")
         return
-    exported = export_path(state)
     try:
-        exported.unlink(missing_ok=True)
-        runtime.export(state, session_id)
-        session = json.loads(exported.read_bytes())
-        messages = session["messages"]
+        runtime.export(call, session_id, path)
+        messages = json.loads(path.read_bytes())["messages"]
         tools = sum(1 for m in messages for p in m.get("parts", []) if p.get("type") == "tool")
-        exported.replace(path)
         host_log(log, f"session {session_id} exported to {path.name}: {len(messages)} messages, {tools} tool calls")
     except Exception as exc:  # noqa: BLE001 - an export failure must not lose the answer
+        path.unlink(missing_ok=True)
         reason = str(exc).strip().splitlines()[-1:] or [type(exc).__name__]
-        host_log(log, f"session {session_id} not exported ({reason[0][:300]}); native store kept at {state}")
+        host_log(log, f"error: session {session_id} not exported ({reason[0][:300]})")
 
 
-def export_path(state: Path) -> Path:
-    # opencode exits before a pipe drains, cutting stdout at 64 KiB, so the
-    # export goes to a file inside the store and is moved out once it parses.
-    return state / "opencode" / "far-export.json"
+# ── opencode configuration ──────────────────────────────────────────────────
 
 
-def remove_auth(state: Path) -> None:
-    (state / "opencode" / "auth.json").unlink(missing_ok=True)
-
-
-# ── Credentials ─────────────────────────────────────────────────────────────
-
-
-def _user_provider_config(provider: str) -> dict[str, Any] | None:
-    config_dir = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "opencode"
-    for name in ("opencode.json", "config.json"):
-        path = config_dir / name
-        if path.exists():
-            try:
-                found = (json.loads(path.read_text()).get("provider") or {}).get(provider)
-            except (json.JSONDecodeError, AttributeError):
-                continue
-            if found:
-                return found
-    return None
-
-
-def opencode_env(model_id: str, container: bool) -> dict[str, str]:
-    """The agents, the pinned settings, and only the selected provider's credentials.
-
-    Everything opencode is configured with travels in OPENCODE_CONFIG_CONTENT,
-    the same way in both modes: the agent definitions, the pinned settings, and for a
-    container the provider's section of the user's global config. The stored
-    login for that provider goes in OPENCODE_AUTH_CONTENT. A local run already
-    inherits the user's environment; a container additionally gets the
-    provider's `<PROVIDER>_API_KEY` / `<PROVIDER>_BASE_URL` variables.
+def opencode_env(model_id: str) -> dict[str, str]:
+    """Everything opencode is configured with: OPENCODE_ENV, and in
+    OPENCODE_CONFIG_CONTENT the agents, the pinned settings, and the model
+    provider's section of the user's global config, which a container cannot
+    read from the host.
     """
-    provider = model_id.split("/", 1)[0]
-    env: dict[str, str] = {}
-    auth_path = Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local/share") / "opencode" / "auth.json"
-    if auth_path.exists():
-        try:
-            entry = json.loads(auth_path.read_text()).get(provider)
-        except json.JSONDecodeError:
-            entry = None
-        if entry:
-            env["OPENCODE_AUTH_CONTENT"] = json.dumps({provider: entry})
     # agents/agents.json is opencode's own `agent` config minus the prompts,
     # which are agents/<name>.md.
     agents = json.loads((AGENTS_DIR / "agents.json").read_text(encoding="utf-8"))
@@ -156,16 +111,17 @@ def opencode_env(model_id: str, container: bool) -> dict[str, str]:
         agent["prompt"] = (AGENTS_DIR / f"{name}.md").read_text(encoding="utf-8").strip()
     # Workspace snapshots would track the enclosing git repository, not the task.
     config: dict[str, Any] = {"snapshot": False, "agent": agents}
-    if container:
-        section = _user_provider_config(provider)
-        names = {f"{provider.upper().replace('-', '_')}_{suffix}" for suffix in ("API_KEY", "BASE_URL")}
+    provider = model_id.split("/", 1)[0]
+    config_dir = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "opencode"
+    for name in ("opencode.json", "config.json"):
+        try:
+            section = (json.loads((config_dir / name).read_text()).get("provider") or {}).get(provider)
+        except (OSError, json.JSONDecodeError, AttributeError):
+            continue
         if section:
             config["provider"] = {provider: section}
-            text = json.dumps(section)
-            names.update(part.split("}", 1)[0] for part in text.split("{env:")[1:])
-        env.update({name: os.environ[name] for name in names if os.environ.get(name)})
-    env["OPENCODE_CONFIG_CONTENT"] = json.dumps(config)
-    return env
+            break
+    return {**OPENCODE_ENV, "OPENCODE_CONFIG_CONTENT": json.dumps(config)}
 
 
 # ── Process helpers ─────────────────────────────────────────────────────────
@@ -175,10 +131,10 @@ def opencode_env(model_id: str, container: bool) -> dict[str, str]:
 class Call:
     """One running attempt."""
 
-    proc: subprocess.Popen
-    state: Path
+    proc: subprocess.Popen | None
     tag: str = ""
     container: str = ""
+    workspace: Path | None = None
     # Local only: every descendant seen while the attempt ran, by pid and
     # creation time, so a pid taken over by another process is not mistaken.
     seen: dict[int, float] = field(default_factory=dict)
@@ -277,6 +233,15 @@ def _signal(pids: set[int], sig: int) -> None:
             pass
 
 
+def _stop(find: Callable[[], set[int]]) -> None:
+    """SIGTERM what `find` returns, then SIGKILL whatever is left after STOP_GRACE."""
+    _signal(find(), signal.SIGTERM)
+    deadline = time.monotonic() + STOP_GRACE
+    while time.monotonic() < deadline and find():
+        time.sleep(0.5)
+    _signal(find(), signal.SIGKILL)
+
+
 # ── Local ───────────────────────────────────────────────────────────────────
 
 
@@ -286,14 +251,13 @@ class LocalRuntime:
     mode = "local"
 
     def __init__(self) -> None:
-        self.owner = process_owner()
         # Attempts between start and cleanup, for kill_all.
         self.active: dict[str, Call] = {}
 
     def recover(self) -> None:
         """Stop processes a dead FAR process on this host left running.
 
-        Their stores are kept; the sessions in them can be exported by hand.
+        Their sessions stay in opencode's own database.
         """
 
         def orphaned(tag: str) -> bool:
@@ -302,36 +266,29 @@ class LocalRuntime:
         left = _members(orphaned)
         if left:
             print(f"[local] stopping {len(left)} agent processes left by a dead FAR process", flush=True)
-            _signal(left, signal.SIGKILL)
+            _stop(lambda: _members(orphaned))
 
-    def path(self, workspace_file: Path) -> str:
-        return str(workspace_file)
-
-    def _env(self, state: Path) -> dict[str, str]:
-        return {
-            **os.environ,
-            **OPENCODE_ENV,
-            "XDG_DATA_HOME": str(state),
-            "XDG_STATE_HOME": str(state / "state"),
-        }
-
-    def start(self, argv: list[str], workspace: Path, state: Path, inputs: list[Path], model_id: str, log) -> Call:
-        tag = f"{self.owner}:{uuid.uuid4().hex[:12]}"
+    def start(self, argv: list[str], workspace: Path, model_id: str, log) -> Call:
+        tag = f"{OWNER}:{uuid.uuid4().hex[:12]}"
         env = {
-            **self._env(state),
-            **opencode_env(model_id, container=False),
+            **os.environ,
+            **opencode_env(model_id),
             TAG_VAR: tag,
             # opencode takes its directory, and so its tools' cwd, from PWD.
             "PWD": str(workspace),
         }
         host_log(log, f"local opencode in {workspace}")
-        call = Call(_popen(argv, cwd=workspace, env=env), state, tag=tag)
+        call = Call(_popen(argv, cwd=workspace, env=env), tag=tag)
         self.active[tag] = call
         return call
 
     def stop(self, call: Call) -> None:
         # Its tools go in cleanup().
-        call.proc.kill()
+        call.proc.terminate()
+        try:
+            call.proc.wait(timeout=STOP_GRACE)
+        except subprocess.TimeoutExpired:
+            call.proc.kill()
 
     def poll(self, call: Call) -> int | None:
         code = call.proc.poll()
@@ -347,13 +304,10 @@ class LocalRuntime:
                         stack.append(pid)
         return code
 
-    def status(self, call: Call) -> tuple[int, str]:
-        return call.proc.wait(), ""
-
-    def export(self, state: Path, session_id: str) -> None:
-        with open(export_path(state), "wb") as out:
+    def export(self, call: Call, session_id: str, path: Path) -> None:
+        with open(path, "wb") as out:
             result = subprocess.run(
-                ["opencode", "export", session_id], cwd=state, env=self._env(state), stdin=subprocess.DEVNULL,
+                ["opencode", "export", session_id], env={**os.environ, **OPENCODE_ENV}, stdin=subprocess.DEVNULL,
                 stdout=out, stderr=subprocess.PIPE, start_new_session=True,
             )  # fmt: skip
         if result.returncode != 0:
@@ -361,149 +315,177 @@ class LocalRuntime:
 
     def cleanup(self, call: Call) -> None:
         # Whatever the agent left running in the background goes with it.
-        _signal(_members(lambda tag: tag == call.tag, [call]), signal.SIGKILL)
+        _stop(lambda: _members(lambda tag: tag == call.tag, [call]))
         self.active.pop(call.tag, None)
-        remove_auth(call.state)
 
     def kill_all(self) -> None:
         """Kill every agent process this FAR process started, at once."""
-        mine = f"{self.owner}:"
+        mine = f"{OWNER}:"
         _signal(_members(lambda tag: tag.startswith(mine), list(self.active.values())), signal.SIGKILL)
 
 
 # ── Docker ──────────────────────────────────────────────────────────────────
 
 
+def _docker(*args: str, **kwargs) -> str:
+    result = _run(["docker", *args], text=True, **kwargs)
+    if result.returncode != 0:
+        raise RuntimeError(f"docker {args[0]} failed: {result.stderr.strip()}")
+    return result.stdout
+
+
+def _exec_stream(container: str, script: str, *args: str, stdin: int = subprocess.DEVNULL) -> subprocess.Popen:
+    """`sh -c script` in the container's working directory, its stdout piped back."""
+    return subprocess.Popen(
+        ["docker", "exec", "-i", container, "sh", "-c", script, "sh", *args],
+        stdin=stdin, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        start_new_session=True,
+    )  # fmt: skip
+
+
+def _finish(proc: subprocess.Popen, what: str) -> None:
+    if proc.wait() != 0:
+        raise RuntimeError(f"{what} failed: {proc.stderr.read().decode(errors='replace').strip()}")
+
+
+def _copy_in(container: str, source: Path) -> None:
+    """The contents of `source` into the container's working directory."""
+    proc = _exec_stream(container, "tar -x", stdin=subprocess.PIPE)
+    with tarfile.open(fileobj=proc.stdin, mode="w|") as archive:
+        for path in source.iterdir():
+            archive.add(path, arcname=path.name)
+    proc.stdin.close()
+    _finish(proc, "copy into container")
+
+
+def _copy_out(container: str, script: str, target: Path) -> None:
+    """Unpack the tar stream `script` writes into `target`, as the host user.
+
+    Whatever the agent left that would reach outside `target`, through a link
+    or an absolute name, is skipped; everything else still comes out.
+    """
+
+    def safe(member: tarfile.TarInfo, path: str) -> tarfile.TarInfo | None:
+        try:
+            return tarfile.data_filter(member, path)
+        except tarfile.FilterError:
+            return None
+
+    target.mkdir(parents=True, exist_ok=True)
+    proc = _exec_stream(container, script)
+    with tarfile.open(fileobj=proc.stdout, mode="r|") as archive:
+        archive.extractall(target, filter=safe)
+    proc.stdout.read()  # the archive's trailing padding
+    _finish(proc, "copy out of container")
+
+
 class DockerRuntime:
-    """opencode in a fresh container per attempt, run as the host user."""
+    """opencode in a fresh container per attempt, nothing mounted from the host.
+
+    The container idles as `sleep` under the image's own user, home, and
+    working directory. Everything else goes through `docker exec`, which runs
+    in that working directory: the inputs go in as a tar stream, opencode
+    runs, is stopped, and exports its session, and the workspace comes back
+    out as a tar stream, as the host user's files, before the container is
+    removed.
+    """
 
     mode = "docker"
 
-    def __init__(self) -> None:
-        self.owner = process_owner()
-        # Files the agent writes stay the host user's, so the next attempt can
-        # rebuild its workspace on any host.
-        self.user = ["--user", f"{os.getuid()}:{os.getgid()}"]
+    def __init__(self, env_names: list[str]) -> None:
+        self.env_names = env_names
 
-    def path(self, workspace_file: Path) -> str:
-        return f"{CONTAINER_WORKSPACE}/{workspace_file.name}"
-
-    def _env_args(self, home: str) -> list[str]:
-        env = {**OPENCODE_ENV, "HOME": home, "XDG_DATA_HOME": CONTAINER_DATA}
-        return [arg for k, v in env.items() for arg in ("-e", f"{k}={v}")]
-
-    def start(self, argv: list[str], workspace: Path, state: Path, inputs: list[Path], model_id: str, log) -> Call:
-        data = state / "opencode"
-        home = state / "home"
-        # Made here, as the host user: Docker would make them as root.
-        for path in (data, home):
-            path.mkdir(parents=True, exist_ok=True)
-        secrets = opencode_env(model_id, container=True)
-        mounts = ["-v", f"{workspace}:{CONTAINER_WORKSPACE}"]
-        for path in inputs:
-            mounts += ["-v", f"{workspace / path.name}:{self.path(path)}:ro"]
-        mounts += [
-            "-v", f"{home}:{CONTAINER_HOME}",
-            "-v", f"{data}:{CONTAINER_DATA}/opencode",
-        ]  # fmt: skip
-        command = [
-            "docker", "create",
-            "--label", f"far.owner={self.owner}", "--label", f"far.log={log.name}", "--label", f"far.state={state}",
-            "--cap-drop", "ALL", "--security-opt", "no-new-privileges", *self.user, *CONTAINER_LIMITS,
-            "-w", CONTAINER_WORKSPACE, *mounts, *self._env_args(CONTAINER_HOME),
+    def start(self, argv: list[str], workspace: Path, model_id: str, log) -> Call:
+        env = {name: os.environ[name] for name in self.env_names if os.environ.get(name)}
+        env.update(opencode_env(model_id))
+        container = _docker(
+            "run", "--detach", "--entrypoint", "sleep",
+            "--label", f"far.owner={OWNER}", "--label", f"far.log={log.name}",
+            "--label", f"far.workspace={workspace}",
             # Names only: docker reads the values from its own environment, so
             # they stay off the command line. `docker inspect` still shows them
             # while the container exists; it is removed when the attempt ends.
-            *[arg for name in secrets for arg in ("-e", name)],
-            DOCKER_IMAGE, *argv,
-        ]  # fmt: skip
-        created = _run(command, env={**os.environ, **secrets}, text=True)
-        if created.returncode != 0:
-            raise RuntimeError(f"docker create failed: {created.stderr.strip()}")
-        container = created.stdout.strip()
+            *[arg for name in env for arg in ("-e", name)],
+            DOCKER_IMAGE, CONTAINER_LIFETIME,
+            env={**os.environ, **env},
+        ).strip()  # fmt: skip
         host_log(log, f"docker container {container[:12]} image {DOCKER_IMAGE}")
         try:
-            return Call(_popen(["docker", "start", "-a", container]), state, container=container)
-        except OSError:
+            _copy_in(container, workspace)
+            proc = _popen(["docker", "exec", container, *argv])
+        except Exception:
             _run(["docker", "rm", "-f", container])
             raise
+        return Call(proc, container=container, workspace=workspace)
+
+    def stop(self, call: Call) -> None:
+        """SIGTERM every process but PID 1, then SIGKILL what is left after STOP_GRACE.
+
+        PID 1 is the idle `sleep`, which no signal from inside the container
+        can stop, so the container stays up for the export.
+        """
+        container = call.container
+        _run(["docker", "exec", container, "sh", "-c", "kill -s TERM -- -1"])
+        deadline = time.monotonic() + STOP_GRACE
+        while time.monotonic() < deadline:
+            rows = _run(["docker", "top", container, "-o", "stat"], text=True).stdout.split()[1:]
+            if sum(1 for stat in rows if not stat.startswith("Z")) <= 1:
+                return
+            time.sleep(0.5)
+        _run(["docker", "exec", container, "sh", "-c", "kill -s KILL -- -1"])
 
     def poll(self, call: Call) -> int | None:
         return call.proc.poll()
 
-    def stop(self, call: Call) -> None:
-        _run(["docker", "kill", call.container])
-
-    def status(self, call: Call) -> tuple[int, str]:
-        call.proc.wait()
-        return self._exit_state(call.container, call.proc.returncode)
-
-    def _exit_state(self, container: str, fallback: int | None) -> tuple[int, str]:
-        # OOM is read from Docker's record, not guessed from exit code 137.
-        result = _run(["docker", "inspect", "-f", "{{.State.ExitCode}} {{.State.OOMKilled}}", container], text=True)
-        code, oom = (result.stdout.split() + ["", ""])[:2]
-        if result.returncode != 0 or not code.lstrip("-").isdigit():
-            return fallback or 1, "container state unavailable"
-        return int(code), "container OOM-killed" if oom == "true" else ""
-
-    def export(self, state: Path, session_id: str) -> None:
-        # A short-lived container with no network: exporting calls no model.
-        target = f"{CONTAINER_DATA}/opencode/{export_path(state).name}"
-        result = _run([
-            "docker", "run", "--rm", "--network", "none",
-            "--cap-drop", "ALL", "--security-opt", "no-new-privileges", *self.user,
-            "-v", f"{state / 'opencode'}:{CONTAINER_DATA}/opencode", *self._env_args("/tmp"),
-            DOCKER_IMAGE, "sh", "-c", 'opencode export "$1" > "$2"', "sh", session_id, target,
-        ])  # fmt: skip
-        if result.returncode != 0:
-            raise RuntimeError(result.stderr.decode(errors="replace") or f"exit {result.returncode}")
+    def export(self, call: Call, session_id: str, path: Path) -> None:
+        # A killed container idles again on start; its files are all still there.
+        _docker("start", call.container)
+        # Into a file inside, then cat, which does drain the pipe.
+        script = 'f=$(mktemp) && opencode export "$1" > "$f" && cat "$f"'
+        proc = _exec_stream(call.container, script, session_id)
+        path.write_bytes(proc.stdout.read())
+        _finish(proc, "session export")
 
     def cleanup(self, call: Call) -> None:
         try:
-            result = _run(["docker", "rm", "-f", call.container])
-            if result.returncode:
-                raise RuntimeError(result.stderr.decode(errors="replace").strip())
+            # Whatever the agent left running in the background goes first.
+            self.stop(call)
+            shutil.rmtree(call.workspace)
+            _copy_out(call.container, "tar -c .", call.workspace)
         finally:
-            remove_auth(call.state)
-            shutil.rmtree(call.state / "home", ignore_errors=True)
+            _docker("rm", "-f", call.container)
 
     def kill_all(self) -> None:
         """Kill every container this FAR process started; recover() finishes them."""
-        listed = _run(["docker", "ps", "-q", "--filter", f"label=far.owner={self.owner}"], text=True)
-        if listed.stdout.split():
-            _run(["docker", "kill", *listed.stdout.split()])
+        containers = _run(["docker", "ps", "-q", "--filter", f"label=far.owner={OWNER}"], text=True).stdout.split()
+        if containers:
+            _run(["docker", "kill", *containers])
 
     def recover(self) -> None:
-        """Wind down containers a dead FAR process on this host left behind.
+        """Finish containers a dead FAR process on this host left behind.
 
         Only containers labelled by FAR whose owning process is gone are
-        touched; a live owner, another host, or an unlabelled container is
-        left alone. The output log gets the container's own log and the
-        session is exported before the container is removed. The store on
-        the host is never deleted. One container failing to recover does not
-        hold up the others or the run.
+        touched. Each one is started again if it was killed, its agent is
+        stopped, its session exported, and its files copied out, as at the end
+        of a normal attempt. One failing does not hold up the others or the run.
         """
-        fmt = '{{.ID}}\t{{.Label "far.owner"}}\t{{.Label "far.log"}}\t{{.Label "far.state"}}'
-        listed = _run(["docker", "ps", "-a", "--filter", "label=far.owner", "--format", fmt], text=True)
-        for row in listed.stdout.splitlines():
-            container, owner, log_name, state = (row.split("\t") + ["", "", ""])[:4]
+        fmt = "\t".join(f'{{{{.Label "far.{name}"}}}}' for name in ("owner", "log", "workspace"))
+        rows = _docker("ps", "-a", "--filter", "label=far.owner", "--format", "{{.ID}}\t" + fmt)
+        for row in rows.splitlines():
+            container, owner, log_name, workspace = (row.split("\t") + [""] * 3)[:4]
             if not owner_gone(owner) or not log_name:
                 continue
             print(f"[docker] recovering container {container} left by {owner}", flush=True)
-            log_path, state_path = Path(log_name), Path(state)
+            log_path = Path(log_name)
+            call = Call(None, container=container, workspace=Path(workspace))
             try:
-                _run(["docker", "kill", container])
+                _docker("start", container)
+                self.stop(call)  # its agent, if it was still running
                 with open(log_path, "ab", buffering=0) as log:
-                    host_log(log, f"recovering container {container} left by dead process {owner}; its log follows")
-                    logs = _run(["docker", "logs", container])
-                    log.write(logs.stdout + logs.stderr)
-                    code, oom = self._exit_state(container, None)
-                    host_log(log, f"recovered container exit code {code} {oom}".rstrip())
+                    host_log(log, f"recovering container {container} left by dead process {owner}")
                     found = re.search(rb'"sessionID":"([^"]+)"', log_path.read_bytes())
                     session_path = log_path.with_name(log_path.name.replace("output_", "session_")).with_suffix(".json")
-                    save_session(self, state_path, found and found[1].decode(), session_path, log)
-                _run(["docker", "rm", "-f", container])
-                remove_auth(state_path)
-                shutil.rmtree(state_path / "home", ignore_errors=True)
+                    save_session(self, call, found and found[1].decode(), session_path, log)
+                self.cleanup(call)
             except Exception as exc:  # noqa: BLE001 - recover the rest, keep this one for a later run
                 print(f"[docker] could not recover {container}: {exc}", flush=True)

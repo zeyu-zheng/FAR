@@ -40,7 +40,7 @@ from src import grade as grade_stage
 from src import judge as judge_stage
 from src import label as label_stage
 from src import solve as solve_stage
-from src.agent import format_elapsed, result_key
+from src.agent import result_key
 from src.runtime import DockerRuntime, LocalRuntime
 from src.reader import Corpus, iter_rows
 from src.utils import (
@@ -52,6 +52,7 @@ from src.utils import (
     RESPONSES_API,
     STAGE_ENV,
     append_jsonl,
+    format_elapsed,
     iter_jsonl,
     load_env_file,
     parse_bool,
@@ -64,7 +65,7 @@ _SENTINEL = object()
 
 STAGES = ("label", "extract", "check", "solve", "judge", "grade")
 # Find stages call the model API directly; Attempt and Recommend go through the
-# opencode agent, which carries its own credentials.
+# opencode agent, which reads its provider's key from the environment.
 API_STAGES = ("label", "extract", "check")
 AGENT_STAGES = ("solve", "judge", "grade")
 # Each stage reads what the one before it wrote.
@@ -638,9 +639,9 @@ def parse_args() -> argparse.Namespace:
         "check": ("gemini-3.1-pro", CHAT_API, "", True, 64, 0.0),
     }
     agent_defaults = {
-        "solve": ("gpt-5.5", "xhigh", 64, 0.0),
-        "judge": ("gpt-5.5", "xhigh", 64, 0.0),
-        "grade": ("gpt-5.5", "xhigh", 64, 0.0),
+        "solve": ("openai/gpt-5.5", "xhigh", 64, 0.0),
+        "judge": ("openai/gpt-5.5", "xhigh", 64, 0.0),
+        "grade": ("openai/gpt-5.5", "xhigh", 64, 0.0),
     }
     for stage, (model, api, effort, web, jobs, ramp) in api_defaults.items():
         group = parser.add_argument_group(f"{stage} stage")
@@ -660,7 +661,7 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def preflight(ctx: "Context", stages: tuple[str, ...]) -> None:
+def preflight(ctx: "Context", stages: tuple[str, ...], env_names: list[str]) -> None:
     """Fail on missing prerequisites before any work starts."""
     args = ctx.args
     if "label" in stages and not args.direction.strip():
@@ -673,16 +674,16 @@ def preflight(ctx: "Context", stages: tuple[str, ...]) -> None:
             for name in STAGE_ENV[stage]:
                 require_env(name)
     if any(stage in AGENT_STAGES for stage in stages):
-        ctx.runtime = DockerRuntime() if args.mode == "docker" else LocalRuntime()
+        ctx.runtime = DockerRuntime(env_names) if args.mode == "docker" else LocalRuntime()
         ctx.runtime.recover()
 
 
 def main() -> None:
     args = parse_args()
-    load_env_file(args.env_file)
+    env_names = load_env_file(args.env_file)
     stages = PHASES.get(args.stage, (args.stage,))
     ctx = Context(args)
-    preflight(ctx, stages)
+    preflight(ctx, stages, env_names)
 
     print("=== FAR ===", flush=True)
     print(f"Stages: {' -> '.join(stages)}", flush=True)
@@ -735,7 +736,7 @@ def main() -> None:
         try:
             join_all(finished)
         except KeyboardInterrupt:
-            # Forced: nothing gets saved, but no agent is left running.
+            # Forced: no agent is left running; what is not saved yet may be lost.
             if ctx.runtime is not None:
                 print("\nForced: killing running agents", flush=True)
                 ctx.runtime.kill_all()
