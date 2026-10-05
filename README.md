@@ -141,8 +141,9 @@ pip install -r requirements.txt
 
 The API keys and endpoints are read from environment variables. `~/.env` is also
 loaded automatically, so you can keep the variables there instead of exporting
-them. Each of the three Find stages takes its own pair, so they can run on
-different providers:
+them; to start from the template, run `cp .env.example ~/.env` and fill it in.
+Each of the three Find stages takes its own pair, so they can run on different
+providers:
 
 ```bash
 export LABEL_API_KEY=...      LABEL_BASE_URL=...
@@ -151,14 +152,16 @@ export CHECK_API_KEY=...      CHECK_BASE_URL=...
 ```
 
 Solve, Judge, and Grade run through the [`opencode`](https://opencode.ai) CLI,
-which manages its own credentials.
+which reads the key of the model's provider, such as `OPENAI_API_KEY` for
+`openai/gpt-5.5`; opencode's free models need none.
 Use OpenCode 1.18.32. Install it using the
 [official instructions](https://opencode.ai/download) and
 ensure it is on `PATH`. It can be replaced by any other agent backbone — Codex,
 Claude Code, Cursor — by editing `src/agent.py`.
 
 To run these three stages in Docker instead (`--mode docker`), start Docker and
-pull the image once; opencode is then not needed on the host:
+pull the image once; opencode is then not needed on the host. Each container
+gets the variables set in `~/.env`, so keep the provider's key there:
 
 ```bash
 docker pull docker/sandbox-templates:opencode-0.7.0
@@ -196,9 +199,9 @@ The defaults reproduce the configuration reported in the paper:
 | label | `gpt-oss-120b` | — | — |
 | extract | `gemini-3.5-flash` | — | — |
 | check | `gemini-3.1-pro` | — | yes |
-| solve | `gpt-5.5` | `xhigh` | yes |
-| judge | `gpt-5.5` | `xhigh` | yes |
-| grade | `gpt-5.5` | `xhigh` | yes |
+| solve | `openai/gpt-5.5` | `xhigh` | yes |
+| judge | `openai/gpt-5.5` | `xhigh` | yes |
+| grade | `openai/gpt-5.5` | `xhigh` | yes |
 
 Solve, Judge, and Grade have no web-search flag, since opencode grants its
 agents web access by default.

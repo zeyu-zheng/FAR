@@ -1,7 +1,7 @@
 CORPUS=data/raw/corpus.arrow
 INPUT=data/checked.jsonl
 
-SOLVE_MODEL=gpt-5.5
+SOLVE_MODEL=openai/gpt-5.5
 SOLVE_EFFORT=xhigh
 SOLVE_JOBS=64
 SOLVE_RAMP=0

@@ -49,13 +49,17 @@ def require_env(name: str) -> str:
     )
 
 
-def load_env_file(path: str | None = "~/.env") -> None:
-    """Load KEY=VALUE lines from an env file without overriding the environment."""
+def load_env_file(path: str | None = "~/.env") -> list[str]:
+    """Load KEY=VALUE lines from an env file without overriding the environment.
+
+    Returns the names the file sets, for passing on to agent containers.
+    """
+    names: list[str] = []
     if not path:
-        return
+        return names
     env_path = Path(path).expanduser()
     if not env_path.exists():
-        return
+        return names
     for raw_line in env_path.read_text().splitlines():
         line = raw_line.strip()
         if not line or line.startswith("#") or "=" not in line:
@@ -65,8 +69,10 @@ def load_env_file(path: str | None = "~/.env") -> None:
         key, value = line.split("=", 1)
         key = key.strip()
         value = value.strip().strip("'\"")
-        if key and key not in os.environ:
-            os.environ[key] = value
+        if key and value:
+            names.append(key)
+            os.environ.setdefault(key, value)
+    return names
 
 
 # ── Cancellation ────────────────────────────────────────────────────────────
@@ -403,3 +409,13 @@ def parse_bool(value: str) -> bool:
         return False
     raise ValueError(f"invalid boolean value: {value}")
 
+
+def format_elapsed(seconds: float) -> str:
+    total = int(round(seconds))
+    hours, remainder = divmod(total, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours:
+        return f"{hours}h {minutes}m {secs}s"
+    if minutes:
+        return f"{minutes}m {secs}s"
+    return f"{secs}s"

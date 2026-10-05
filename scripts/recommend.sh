@@ -2,12 +2,12 @@ CORPUS=data/raw/corpus.arrow
 INPUT=data/solved.jsonl
 JUDGES=1
 
-JUDGE_MODEL=gpt-5.5
+JUDGE_MODEL=openai/gpt-5.5
 JUDGE_EFFORT=xhigh
 JUDGE_JOBS=64
 JUDGE_RAMP=0
 
-GRADE_MODEL=gpt-5.5
+GRADE_MODEL=openai/gpt-5.5
 GRADE_EFFORT=xhigh
 GRADE_JOBS=64
 GRADE_RAMP=0
