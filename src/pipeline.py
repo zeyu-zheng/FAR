@@ -12,6 +12,7 @@ disk, so any stage can be run on its own against an earlier stage's file:
     python src/pipeline.py --stage find  --input data/raw/corpus
     python src/pipeline.py --stage check --input data/extracted.jsonl
     python src/pipeline.py --stage grade --input data/judged.jsonl
+    python src/pipeline.py --stage attempt --corpus data/debug.arrow --mode docker
 
 Re-running Judge or Grade on their own rebuilds the agent workspace from the
 persisted record, so changing a judging rule does not re-run the prover.
@@ -39,7 +40,8 @@ from src import grade as grade_stage
 from src import judge as judge_stage
 from src import label as label_stage
 from src import solve as solve_stage
-from src.agent import format_elapsed, require_opencode, result_key
+from src.agent import format_elapsed, result_key
+from src.runtime import make_runtime
 from src.reader import Corpus, iter_rows
 from src.utils import (
     HTTP_RETRIES,
@@ -236,6 +238,8 @@ class Context:
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.work_root = Path(args.work_root).expanduser().resolve()
         self.corpus = Corpus(args.corpus)
+        # Where Solve, Judge, and Grade run their agents; set by preflight.
+        self.runtime = None
         self._done: dict[str, set] = {}
         self._clients: dict[str, LLMClient] = {}
         self._client_lock = threading.Lock()
@@ -496,7 +500,7 @@ def run_solve(ctx: Context, in_queue, out_queue) -> None:
     def work(task):
         def once():
             return solve_stage.solve_one(
-                task, args.solve_model, args.solve_effort or None, tail(ctx.body(task)),
+                ctx.runtime, task, args.solve_model, args.solve_effort or None, tail(ctx.body(task)),
                 ctx.work_root, args.retry_count, ctx.stop_event,
             )
 
@@ -516,6 +520,7 @@ def run_judge(ctx: Context, in_queue, out_queue) -> None:
     def work(item):
         def once():
             return judge_stage.judge_one(
+                ctx.runtime,
                 item,
                 args.judge_model,
                 args.judge_effort or None,
@@ -542,7 +547,7 @@ def run_grade(ctx: Context, in_queue, out_queue) -> None:
     def work(item):
         def once():
             return grade_stage.grade_one(
-                item, args.grade_model, args.grade_effort or None, tail(ctx.body(item)),
+                ctx.runtime, item, args.grade_model, args.grade_effort or None, tail(ctx.body(item)),
                 ctx.work_root, args.retry_count, ctx.stop_event,
             )
 
@@ -596,6 +601,12 @@ def parse_args() -> argparse.Namespace:
         "without this would write them a second time; delete the file to start over",
     )
     parser.add_argument("--retry-count", type=int, default=3)
+    parser.add_argument(
+        "--mode",
+        choices=("local", "docker"),
+        default="local",
+        help="Where Solve, Judge, and Grade run opencode: on this machine, or one container per attempt",
+    )
 
     parser.add_argument("--timeout", type=float, default=3600.0)
     parser.add_argument("--max-tokens", type=int, default=32000)
@@ -649,8 +660,9 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def preflight(args: argparse.Namespace, stages: tuple[str, ...]) -> None:
+def preflight(ctx: "Context", stages: tuple[str, ...]) -> None:
     """Fail on missing prerequisites before any work starts."""
+    args = ctx.args
     if "label" in stages and not args.direction.strip():
         raise SystemExit(
             "--direction is required for the label stage: it is the research direction "
@@ -661,15 +673,18 @@ def preflight(args: argparse.Namespace, stages: tuple[str, ...]) -> None:
             for name in STAGE_ENV[stage]:
                 require_env(name)
     if any(stage in AGENT_STAGES for stage in stages):
-        require_opencode()
+        # Docker unavailable is an error, never a silent fall back to local.
+        ctx.runtime = make_runtime(args)
+        ctx.runtime.preflight()
+        ctx.runtime.recover()
 
 
 def main() -> None:
     args = parse_args()
     load_env_file(args.env_file)
     stages = PHASES.get(args.stage, (args.stage,))
-    preflight(args, stages)
     ctx = Context(args)
+    preflight(ctx, stages)
 
     print("=== FAR ===", flush=True)
     print(f"Stages: {' -> '.join(stages)}", flush=True)
@@ -677,38 +692,50 @@ def main() -> None:
     if stages[0] in PREVIOUS:
         print(f"Input:  {ctx.source_path(stages[0])}", flush=True)
     print(f"Output: {ctx.data_dir}", flush=True)
+    if ctx.runtime is not None:
+        print(f"Agents: {ctx.runtime.mode}", flush=True)
     if args.resume:
         print("Resume: " + " ".join(f"{stage}={len(ctx.done(stage))}" for stage in stages), flush=True)
 
     started = time.monotonic()
 
-    if len(stages) == 1:
-        RUNNERS[stages[0]](ctx, None, None)
-    else:
-        queues = [queue.Queue(maxsize=QUEUE_MAXSIZE) for _ in range(len(stages) - 1)]
-        errors: queue.Queue = queue.Queue()
+    queues = [queue.Queue(maxsize=QUEUE_MAXSIZE) for _ in range(len(stages) - 1)]
+    errors: queue.Queue = queue.Queue()
 
-        def launch(index: int, stage: str) -> threading.Thread:
-            in_queue = queues[index - 1] if index > 0 else None
-            out_queue = queues[index] if index < len(queues) else None
+    def launch(index: int, stage: str) -> threading.Thread:
+        in_queue = queues[index - 1] if index > 0 else None
+        out_queue = queues[index] if index < len(queues) else None
 
-            def wrapped():
-                try:
-                    RUNNERS[stage](ctx, in_queue, out_queue)
-                except BaseException as exc:  # noqa: BLE001 - surface and stop the run
-                    ctx.stop_event.set()
-                    errors.put((stage, exc))
+        def wrapped():
+            try:
+                RUNNERS[stage](ctx, in_queue, out_queue)
+            except BaseException as exc:  # noqa: BLE001 - surface and stop the run
+                ctx.stop_event.set()
+                errors.put((stage, exc))
 
-            thread = threading.Thread(target=wrapped, name=stage, daemon=True)
-            thread.start()
-            return thread
+        thread = threading.Thread(target=wrapped, name=stage, daemon=True)
+        thread.start()
+        return thread
 
-        threads = [launch(index, stage) for index, stage in enumerate(stages)]
+    def join_all(threads: list[threading.Thread]) -> None:
         for thread in threads:
-            thread.join()
-        if not errors.empty():
-            stage, exc = errors.get()
-            raise RuntimeError(f"{stage} stage failed") from exc
+            while thread.is_alive():
+                thread.join(0.5)
+
+    # Stages run off the main thread so Ctrl-C lands here, where it can stop
+    # every stage and let running agents save their logs and sessions.
+    threads = [launch(index, stage) for index, stage in enumerate(stages)]
+    try:
+        join_all(threads)
+    except KeyboardInterrupt:
+        print("\nInterrupted: stopping agents and saving their logs (Ctrl-C again to force)", flush=True)
+        ctx.stop_event.set()
+        join_all(threads)
+        ctx.stats.report()
+        raise SystemExit(130)
+    if not errors.empty():
+        stage, exc = errors.get()
+        raise RuntimeError(f"{stage} stage failed") from exc
 
     print(f"\n=== Complete in {format_elapsed(time.monotonic() - started)} ===", flush=True)
     ctx.stats.report()

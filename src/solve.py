@@ -32,6 +32,7 @@ from src.prompts import PROVER_USER_PROMPT
 
 
 def solve_one(
+    runtime,
     task: dict[str, Any],
     model: str,
     effort: str | None,
@@ -43,23 +44,25 @@ def solve_one(
     """Run one attempt and return the record Judge consumes."""
     started_at = time.time()
     work_dir = prepare_work_dir(task, body, work_root)
-    input_path = work_dir / "input.json"
+    stage_dir = work_dir / "solve"
 
     solution = run_agent(
+        runtime,
         model,
         effort,
         PROVER_AGENT,
         PROVER_USER_PROMPT,
-        work_dir,
+        stage_dir,
+        [work_dir / "input.json"],
         retries,
         SOURCE_WORDS,
-        [input_path],
         stop_event,
     )
+    (stage_dir / "solution.md").write_text(solution, encoding="utf-8")
     source = parse_first_word(solution, SOURCE_WORDS, "NONE")
 
-    # Persist the solution next to input.json so Judge finds the workspace
-    # already populated when it runs straight after this stage.
+    # Persist the solution next to input.json so Judge finds its input
+    # already in place when it runs straight after this stage.
     if source in {"KNOWN", "NEW"}:
         (work_dir / "solution.md").write_text(solution, encoding="utf-8")
 

@@ -31,12 +31,14 @@ from src.agent import (
     run_agent,
 )
 from src.prompts import GRADER_USER_PROMPT
+from src.utils import PipelineCancelled
 
 ARTIFACT_QUALITIES = {"type2", "type3"}
 
 
 
 def grade_one(
+    runtime,
     item: dict[str, Any],
     model: str,
     effort: str | None,
@@ -47,25 +49,30 @@ def grade_one(
 ) -> dict[str, Any]:
     started_at = time.time()
     work_dir = restore_workspace(item, body, work_root)
+    stage_dir = work_dir / "grade"
     try:
         grade_text = run_agent(
+            runtime,
             model,
             effort,
             GRADER_AGENT,
             GRADER_USER_PROMPT,
-            work_dir,
+            stage_dir,
+            [work_dir / "input.json", work_dir / "solution.md", work_dir / "judge.md"],
             retries,
             QUALITY_WORDS,
-            [work_dir / "input.json", work_dir / "solution.md", work_dir / "judge.md"],
             stop_event,
         )
         quality_word = parse_first_word(grade_text, QUALITY_WORDS, "")
         quality = QUALITY_LABELS.get(quality_word, "ungraded")
+    except PipelineCancelled:
+        raise
     except Exception as exc:  # noqa: BLE001 - record grader failure for manual triage
         grade_text = f"ERROR\nGrader failed: {exc}"
         quality_word = "ERROR"
         quality = "error"
 
+    (stage_dir / "grade.md").write_text(grade_text, encoding="utf-8")
     grade_path = work_dir / "grade.md"
     grade_path.write_text(grade_text, encoding="utf-8")
     return {

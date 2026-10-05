@@ -1,17 +1,22 @@
 """External agent backend for the Solve, Judge, and Grade stages.
 
 These three stages do not call the model API directly. Each runs an `opencode`
-agent in a per-candidate working directory that holds the stage's inputs as
-files, exactly as the user prompts instruct the agent to read them.
+agent, locally or in Docker (see runtime.py), in a fresh workspace that holds
+the stage's inputs as files, exactly as the user prompts instruct the agent to
+read them.
 
-The workspace layout is the contract between the three stages:
+The layout under each candidate's directory:
 
-    <work_root>/<work_name>/
-        input.json      written by write_input_json()  -- read by all three
-        solution.md     written by Solve               -- read by Judge, Grade
-        judge_NN.md     written by Judge (one per judge run)
-        judge.md        written by Judge (concatenated) -- read by Grade
-        grade.md        written by Grade
+    <work_root>/row_R_candidate_C/
+        input.json, solution.md, judge.md, grade.md   the candidate's records
+        solve/  judge_001/ ...  grade/                one directory per stage or judge round
+            workspace/                                rebuilt from the records for every attempt
+            solution.md | judge.md | grade.md         the answer, saved by Python
+            output_NNN.log                            opencode's raw output for attempt NNN
+            session_NNN.json                          opencode's exported session for attempt NNN
+
+NNN counts attempts at that one call -- retries, and re-runs over the same
+directory -- so no attempt's log or session overwrites another's.
 
 Because Judge and Grade can run either straight after Solve or as separate
 passes over an earlier run's output, `write_input_json` is the single writer
@@ -19,20 +24,20 @@ for input.json, so that a stage run over an earlier sweep hands its agent the
 same bytes as one that ran inline.
 """
 
+import collections
 import json
 import os
-import pty
 import select
 import shutil
-import subprocess
 import threading
+import time
 from pathlib import Path
 from typing import Any
 
+from src.runtime import host_log, save_session
 from src.utils import PipelineCancelled, check_cancelled, wait_retry
 
 RETRY_SLEEP = 60
-AGENT_CONFIG_DIR = Path(__file__).resolve().parent.parent
 
 PROVER_AGENT = "prover"
 JUDGE_AGENT = "judge"
@@ -138,126 +143,200 @@ def prepare_work_dir(task: dict[str, Any], body: str, work_root: Path) -> Path:
 # ── opencode backend ────────────────────────────────────────────────────────
 
 
-def require_opencode() -> None:
-    if shutil.which("opencode") is None:
-        raise SystemExit(
-            "opencode executable not found on PATH; install opencode or update PATH "
-            "before running the solve, judge, or grade stages."
-        )
-
-
 def opencode_model(model: str) -> str:
     if "/" in model:
         return model
     return f"openai/{model}"
 
 
-def run_opencode_command(
-    command: list[str], stop_event: threading.Event | None, work_dir: Path
-) -> tuple[int, str]:
-    """Run opencode on a pty and stream its output, honouring cancellation."""
-    master, slave = pty.openpty()
-    output = bytearray()
-    env = {**os.environ, "OPENCODE_CONFIG_DIR": str(AGENT_CONFIG_DIR)}
-    proc = subprocess.Popen(
-        command,
-        cwd=work_dir,
-        env=env,
-        stdin=subprocess.DEVNULL,
-        stdout=slave,
-        stderr=slave,
-        close_fds=True,
-    )
-    os.close(slave)
+def opencode_command(model_id: str, effort: str | None, agent: str, message: str, files: list[str]) -> list[str]:
+    command = ["opencode", "run", "--format", "json", "--model", model_id, "--agent", agent]
+    if effort:
+        command.extend(["--variant", effort])
+    command.append(message)
+    for path in files:
+        command.extend(["--file", path])
+    return command
+
+
+class OpencodeOutput:
+    """Reads opencode's JSON event stream as it arrives.
+
+    Keeps only what the pipeline needs -- the text parts, the session id, and a
+    short tail of anything else for error messages; the full stream is in the
+    attempt's output log.
+    """
+
+    def __init__(self) -> None:
+        self.buffer = b""
+        self.texts: list[str] = []
+        self.session_id: str | None = None
+        self.tail: collections.deque[str] = collections.deque(maxlen=20)
+
+    def feed(self, chunk: bytes) -> None:
+        *lines, self.buffer = (self.buffer + chunk).split(b"\n")
+        for line in lines:
+            self.line(line)
+
+    def close(self) -> None:
+        if self.buffer:
+            self.line(self.buffer)
+            self.buffer = b""
+
+    def line(self, raw: bytes) -> None:
+        text = raw.decode(errors="replace").strip()
+        if not text:
+            return
+        try:
+            event = json.loads(text)
+        except json.JSONDecodeError:
+            self.tail.append(text)
+            return
+        if not isinstance(event, dict):
+            return
+        self.session_id = self.session_id or event.get("sessionID")
+        part = event.get("part") or {}
+        if event.get("type") == "text" and part.get("text"):
+            self.texts.append(part["text"])
+        elif event.get("type") == "error":
+            self.tail.append(text[:1000])
+
+
+def pump(runtime, call, log, output: OpencodeOutput, stop_event: threading.Event | None, deadline: float | None = None) -> bool:
+    """Copy the process output to the log as it comes. True if cancelled first."""
+    fd = call.proc.stdout.fileno()
+    while deadline is None or time.monotonic() < deadline:
+        if deadline is None and stop_event is not None and stop_event.is_set():
+            return True
+        exited = runtime.poll(call) is not None
+        ready, _, _ = select.select([fd], [], [], 1)
+        if not ready:
+            if exited:
+                break
+            continue
+        chunk = os.read(fd, 65536)
+        if not chunk:
+            break
+        log.write(chunk)
+        output.feed(chunk)
+        # A tool may retain stdout after opencode exits. Bound only this
+        # final drain, so background output cannot keep a finished call alive.
+        if exited and deadline is None:
+            deadline = time.monotonic() + 5
+    output.close()
+    return False
+
+
+def next_attempt(stage_dir: Path) -> int:
+    numbers = [int(p.stem[7:]) for p in stage_dir.glob("output_*.log") if p.stem[7:].isdigit()]
+    return max(numbers, default=0) + 1
+
+
+def reset_workspace(stage_dir: Path, inputs: list[Path]) -> Path:
+    """Empty the workspace and copy in this stage's inputs, read-only."""
+    workspace = stage_dir / "workspace"
+    if workspace.exists():
+        def writable(func, path, _exc):
+            os.chmod(path, 0o700)
+            func(path)
+
+        shutil.rmtree(workspace, onerror=writable)
+    workspace.mkdir(parents=True)
+    for path in inputs:
+        target = workspace / path.name
+        shutil.copyfile(path, target)
+        target.chmod(0o444)
+    return workspace
+
+
+def run_attempt(
+    runtime,
+    model_id: str,
+    effort: str | None,
+    agent: str,
+    message: str,
+    stage_dir: Path,
+    inputs: list[Path],
+    expected_first_words: set[str],
+    stop_event: threading.Event | None,
+) -> str:
+    """One opencode call: fresh workspace, one output log, one session export."""
+    number = next_attempt(stage_dir)
+    log_path = stage_dir / f"output_{number:03d}.log"
+    session_path = stage_dir / f"session_{number:03d}.json"
+    state = stage_dir / ".opencode" / f"{number:03d}"
+    state.mkdir(parents=True, exist_ok=True)
+    output = OpencodeOutput()
     cancelled = False
-    try:
-        while proc.poll() is None:
-            if stop_event is not None and stop_event.is_set():
-                cancelled = True
-                break
-            ready, _, _ = select.select([master], [], [], 1)
-            if not ready:
-                continue
-            try:
-                chunk = os.read(master, 4096)
-            except OSError:
-                break
-            if not chunk:
-                break
-            output.extend(chunk)
-        if not cancelled:
-            while True:
+    code, problem = 1, "call did not finish"
+    with open(log_path, "xb", buffering=0) as log:
+        host_log(log, f"attempt {number:03d} mode={runtime.mode} agent={agent} model={model_id} variant={effort or '-'}")
+        try:
+            workspace = reset_workspace(stage_dir, inputs)
+            command = opencode_command(
+                model_id, effort, agent, message, [runtime.path(workspace / path.name) for path in inputs]
+            )
+            with runtime.slot(stop_event):
+                check_cancelled(stop_event)
+                call = runtime.start(command, workspace, state, inputs, model_id, log)
                 try:
-                    chunk = os.read(master, 4096)
-                except OSError:
-                    break
-                if not chunk:
-                    break
-                output.extend(chunk)
-    finally:
-        os.close(master)
-        if proc.poll() is None:
-            proc.terminate()
-            try:
-                proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                proc.kill()
+                    cancelled = pump(runtime, call, log, output, stop_event)
+                finally:
+                    cancelled = cancelled or (stop_event is not None and stop_event.is_set())
+                    # Each step gets its own error handling: an inspection or
+                    # cleanup error must not skip the available trajectory.
+                    try:
+                        if call.proc.poll() is None or cancelled:
+                            runtime.stop(call)
+                            pump(runtime, call, log, output, None, deadline=time.monotonic() + 5)
+                        code, problem = runtime.status(call)
+                    except Exception as exc:
+                        problem = f"finish failed: {exc}"
+                        host_log(log, problem)
+                    host_log(log, f"{'cancelled, ' if cancelled else ''}exit code {code} {problem}".rstrip())
+                    save_session(runtime, state, output.session_id, session_path, log)
+                    try:
+                        runtime.cleanup(call)
+                    except Exception as exc:
+                        host_log(log, f"cleanup failed: {exc}; resources may need recovery")
+        except Exception as exc:
+            host_log(log, f"{type(exc).__name__}: {exc}")
+            raise
     if cancelled:
         raise PipelineCancelled("pipeline cancelled")
-    return proc.wait(), output.decode(errors="replace")
+    if code != 0 or problem:
+        details = " | ".join(output.tail)[-2000:]
+        raise RuntimeError(f"opencode exited with {code}{', ' + problem if problem else ''} ({log_path}): {details}")
+    text = select_expected_output(output.texts, expected_first_words)
+    if not text:
+        raise RuntimeError(f"empty opencode output ({log_path})")
+    if parse_first_word(text, expected_first_words, "") == "":
+        raise RuntimeError(f"unexpected first word in opencode output: {text.splitlines()[0][:80]}")
+    return text
 
 
 def run_agent(
+    runtime,
     model: str,
     effort: str | None,
     agent: str,
     message: str,
-    work_dir: Path,
+    stage_dir: Path,
+    inputs: list[Path],
     retries: int,
     expected_first_words: set[str],
-    attachments: list[Path],
     stop_event: threading.Event | None = None,
 ) -> str:
     """Run one agent turn and return its validated final text."""
-    work_dir = work_dir.resolve()
+    stage_dir.mkdir(parents=True, exist_ok=True)
     last_error = None
     for attempt in range(1, retries + 2):
         check_cancelled(stop_event)
         try:
-            model_id = opencode_model(model)
-            command = [
-                "opencode",
-                "run",
-                "--format",
-                "json",
-                "--model",
-                model_id,
-                "--agent",
-                agent,
-            ]
-            if effort:
-                command.extend(["--variant", effort])
-            command.append(message)
-            for path in attachments:
-                command.extend(["--file", str(path.resolve())])
-            returncode, output = run_opencode_command(command, stop_event, work_dir)
-            if returncode != 0:
-                raise RuntimeError(output.strip())
-            parts = []
-            for line in output.splitlines():
-                try:
-                    event = json.loads(line.strip())
-                except json.JSONDecodeError:
-                    continue
-                part = event.get("part") or {}
-                if event.get("type") == "text" and part.get("text"):
-                    parts.append(part["text"])
-            text = select_expected_output(parts, expected_first_words)
-            if not text:
-                raise RuntimeError("empty opencode output")
-            if parse_first_word(text, expected_first_words, "") == "":
-                raise RuntimeError(f"unexpected first word in opencode output: {text.splitlines()[0][:80]}")
-            return text
+            return run_attempt(
+                runtime, opencode_model(model), effort, agent, message,
+                stage_dir, inputs, expected_first_words, stop_event,
+            )  # fmt: skip
         except PipelineCancelled:
             raise
         except Exception as exc:  # noqa: BLE001 - retry transient opencode/backend failures

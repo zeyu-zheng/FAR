@@ -156,6 +156,18 @@ Use OpenCode 1.18.32. Install it using the
 ensure it is on `PATH`. It can be replaced by any other agent backbone — Codex,
 Claude Code, Cursor — by editing `src/agent.py`.
 
+To run these three stages in Docker instead (`--mode docker`), start Docker and
+pull the pinned image once; opencode is then not needed on the host:
+
+```bash
+docker pull docker/sandbox-templates:opencode-0.7.0@sha256:b3b69aa5148a20d1c0e3ec4d5db2975b8b9d6830d46d50a93fd766aec7d6668b
+```
+
+Each container sees only its stage's inputs, the agent definitions, and the
+selected provider's credentials: its entry from opencode's `auth.json`, its
+`<PROVIDER>_API_KEY` / `<PROVIDER>_BASE_URL` variables, and its section of the
+global opencode config.
+
 ## Running
 
 The four scripts in `scripts/` cover the three phases and the whole pipeline.
@@ -178,6 +190,7 @@ python src/pipeline.py --stage grade --input data/judged.jsonl
 Common flags are `--direction` for the research direction, `--limit N` for a
 trial on a few rows, `--resume true` to continue an interrupted run, `--judges N`
 for independent judge passes per solution, and `--<stage>-jobs` for concurrency.
+`--mode docker` runs each agent attempt in its own container.
 `python src/pipeline.py --help` lists all of them.
 
 The defaults reproduce the configuration reported in the paper:
@@ -196,7 +209,10 @@ agents web access by default.
 
 A run writes two directories: `data/` for the stage
 outputs, one `.jsonl` per stage, and `.far/` for the agent workspaces, one per
-conjecture.
+conjecture. Inside each conjecture's directory, `solve/`, `judge_001/`, … and
+`grade/` hold that stage's answer, plus one `output_NNN.log` (raw opencode
+output) and `session_NNN.json` (the exported opencode session) per attempt.
+Ctrl-C stops running agents and keeps their logs and sessions.
 
 ## Citation
 

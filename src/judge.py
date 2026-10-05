@@ -32,10 +32,12 @@ from src.agent import (
     run_agent,
 )
 from src.prompts import JUDGE_USER_PROMPT
+from src.utils import PipelineCancelled
 
 
 
 def judge_one(
+    runtime,
     item: dict[str, Any],
     model: str,
     effort: str | None,
@@ -47,32 +49,36 @@ def judge_one(
 ) -> dict[str, Any]:
     started_at = time.time()
     work_dir = restore_workspace(item, body, work_root)
-    input_path = work_dir / "input.json"
-    solution_path = work_dir / "solution.md"
+    inputs = [work_dir / "input.json", work_dir / "solution.md"]
 
     judge_results = []
     for judge_id in range(1, max(judges, 1) + 1):
         judge_started_at = time.time()
+        # Each round starts from the same inputs; none sees another's verdict.
+        stage_dir = work_dir / f"judge_{judge_id:03d}"
         try:
             judge_text = run_agent(
+                runtime,
                 model,
                 effort,
                 JUDGE_AGENT,
                 JUDGE_USER_PROMPT,
-                work_dir,
+                stage_dir,
+                inputs,
                 retries,
                 JUDGE_WORDS,
-                [input_path, solution_path],
                 stop_event,
             )
             verdict = parse_first_word(judge_text, JUDGE_WORDS, "FAIL")
             judge_error = False
+        except PipelineCancelled:
+            raise
         except Exception as exc:
             verdict = "FAIL"
             judge_text = f"FAIL\nJudge {judge_id} failed: {exc}"
             judge_error = True
         duration = time.time() - judge_started_at
-        trace_path = work_dir / f"judge_{judge_id:02d}.md"
+        trace_path = stage_dir / "judge.md"
         trace_path.write_text(judge_text, encoding="utf-8")
         judge_results.append(
             {
