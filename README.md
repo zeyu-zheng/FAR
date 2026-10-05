@@ -18,7 +18,7 @@ FAR: Find, Attempt, and Recommend
 
 <div align="center" style="line-height: 1;">
   <a href="https://arxiv.org/abs/2608.16977"><img src="https://img.shields.io/badge/arXiv-2608.16977-b31b1b.svg?style=flat-square&labelColor=000000"></a>
-  <a href="https://probxiv.com"><img src="https://img.shields.io/badge/Forum-probXiv.com-007BC0?style=flat-square&labelColor=000000"></a>
+  <a href="https://probxiv.com"><img src="https://img.shields.io/badge/Forum-ProbXiv.com-007BC0?style=flat-square&labelColor=000000"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache%202.0-6D6E71.svg?style=flat-square&labelColor=000000"></a>
 </div>
 
@@ -98,8 +98,9 @@ The code uses the names from the paper.
 
 Find prompts and per-task agent messages are in `src/prompts.py`. Solve, Judge,
 and Grade system prompts are maintained directly in `agents/prover.md`,
-`judge.md`, and `grader.md`, matching appendix A of the paper. Output schemas
-and validators are in `src/schemas.py`.
+`judge.md`, and `grader.md`, matching appendix A of the paper, with their
+opencode settings in `agents/agents.json`. Output schemas and validators are in
+`src/schemas.py`.
 
 ### The research direction
 
@@ -157,16 +158,11 @@ ensure it is on `PATH`. It can be replaced by any other agent backbone — Codex
 Claude Code, Cursor — by editing `src/agent.py`.
 
 To run these three stages in Docker instead (`--mode docker`), start Docker and
-pull the pinned image once; opencode is then not needed on the host:
+pull the image once; opencode is then not needed on the host:
 
 ```bash
-docker pull docker/sandbox-templates:opencode-0.7.0@sha256:b3b69aa5148a20d1c0e3ec4d5db2975b8b9d6830d46d50a93fd766aec7d6668b
+docker pull docker/sandbox-templates:opencode-0.7.0
 ```
-
-Each container sees only its stage's inputs, the agent definitions, and the
-selected provider's credentials: its entry from opencode's `auth.json`, its
-`<PROVIDER>_API_KEY` / `<PROVIDER>_BASE_URL` variables, and its section of the
-global opencode config.
 
 ## Running
 
@@ -183,8 +179,8 @@ bash scripts/recommend.sh    # judge -> grade -> recommend.log
 You can also run a single stage against an earlier stage's output:
 
 ```bash
-python src/pipeline.py --stage check --input data/extracted.jsonl
-python src/pipeline.py --stage grade --input data/judged.jsonl
+python src/pipeline.py --stage check --corpus /path/to/corpus.arrow --input data/extracted.jsonl
+python src/pipeline.py --stage grade --corpus /path/to/corpus.arrow --input data/judged.jsonl
 ```
 
 Common flags are `--direction` for the research direction, `--limit N` for a
@@ -209,10 +205,8 @@ agents web access by default.
 
 A run writes two directories: `data/` for the stage
 outputs, one `.jsonl` per stage, and `.far/` for the agent workspaces, one per
-conjecture. Inside each conjecture's directory, `solve/`, `judge_001/`, … and
-`grade/` hold that stage's answer, plus one `output_NNN.log` (raw opencode
-output) and `session_NNN.json` (the exported opencode session) per attempt.
-Ctrl-C stops running agents and keeps their logs and sessions.
+conjecture. Each stage there keeps its answer, plus an `output_NNN.log` and a
+`session_NNN.json` per opencode run.
 
 ## Citation
 

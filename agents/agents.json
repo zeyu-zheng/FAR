@@ -1,0 +1,14 @@
+{
+  "prover": {
+    "description": "Research-level mathematical prover for resolving conjectures.",
+    "mode": "primary"
+  },
+  "judge": {
+    "description": "Strict mathematical verifier for claimed conjecture resolutions.",
+    "mode": "primary"
+  },
+  "grader": {
+    "description": "Quality-control referee that grades accepted results by novelty and significance.",
+    "mode": "primary"
+  }
+}

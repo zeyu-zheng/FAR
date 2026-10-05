@@ -8,10 +8,10 @@ Stages are chained by bounded queues, so one conjecture can be in Solve while
 another paper is still being labelled. Every stage also appends its output to
 disk, so any stage can be run on its own against an earlier stage's file:
 
-    python src/pipeline.py --stage all   --input data/raw/corpus
-    python src/pipeline.py --stage find  --input data/raw/corpus
-    python src/pipeline.py --stage check --input data/extracted.jsonl
-    python src/pipeline.py --stage grade --input data/judged.jsonl
+    python src/pipeline.py --stage all     --corpus data/debug.arrow
+    python src/pipeline.py --stage find    --corpus data/debug.arrow
+    python src/pipeline.py --stage check   --corpus data/debug.arrow --input data/extracted.jsonl
+    python src/pipeline.py --stage grade   --corpus data/debug.arrow --input data/judged.jsonl
     python src/pipeline.py --stage attempt --corpus data/debug.arrow --mode docker
 
 Re-running Judge or Grade on their own rebuilds the agent workspace from the
@@ -673,9 +673,7 @@ def preflight(ctx: "Context", stages: tuple[str, ...]) -> None:
             for name in STAGE_ENV[stage]:
                 require_env(name)
     if any(stage in AGENT_STAGES for stage in stages):
-        # Docker unavailable is an error, never a silent fall back to local.
         ctx.runtime = make_runtime(args)
-        ctx.runtime.preflight()
         ctx.runtime.recover()
 
 
@@ -702,9 +700,10 @@ def main() -> None:
     queues = [queue.Queue(maxsize=QUEUE_MAXSIZE) for _ in range(len(stages) - 1)]
     errors: queue.Queue = queue.Queue()
 
-    def launch(index: int, stage: str) -> threading.Thread:
+    def launch(index: int, stage: str) -> threading.Event:
         in_queue = queues[index - 1] if index > 0 else None
         out_queue = queues[index] if index < len(queues) else None
+        finished = threading.Event()
 
         def wrapped():
             try:
@@ -712,25 +711,35 @@ def main() -> None:
             except BaseException as exc:  # noqa: BLE001 - surface and stop the run
                 ctx.stop_event.set()
                 errors.put((stage, exc))
+            finally:
+                finished.set()
 
-        thread = threading.Thread(target=wrapped, name=stage, daemon=True)
-        thread.start()
-        return thread
+        threading.Thread(target=wrapped, name=stage, daemon=True).start()
+        return finished
 
-    def join_all(threads: list[threading.Thread]) -> None:
-        for thread in threads:
-            while thread.is_alive():
-                thread.join(0.5)
+    def join_all(stages_finished: list[threading.Event]) -> None:
+        # Not Thread.join: on Python 3.11 a join interrupted by Ctrl-C leaves
+        # the thread looking finished, and the second wait would not wait.
+        for finished in stages_finished:
+            while not finished.wait(0.5):
+                pass
 
     # Stages run off the main thread so Ctrl-C lands here, where it can stop
     # every stage and let running agents save their logs and sessions.
-    threads = [launch(index, stage) for index, stage in enumerate(stages)]
+    finished = [launch(index, stage) for index, stage in enumerate(stages)]
     try:
-        join_all(threads)
+        join_all(finished)
     except KeyboardInterrupt:
         print("\nInterrupted: stopping agents and saving their logs (Ctrl-C again to force)", flush=True)
         ctx.stop_event.set()
-        join_all(threads)
+        try:
+            join_all(finished)
+        except KeyboardInterrupt:
+            # Forced: nothing gets saved, but no agent is left running.
+            if ctx.runtime is not None:
+                print("\nForced: killing running agents", flush=True)
+                ctx.runtime.kill_all()
+            raise SystemExit(130)
         ctx.stats.report()
         raise SystemExit(130)
     if not errors.empty():

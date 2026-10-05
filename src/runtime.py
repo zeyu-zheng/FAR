@@ -12,6 +12,12 @@ the process or container, so a session can be exported after a crash or a
 cancel. Credentials never go into it: the selected provider's entry is passed
 through OPENCODE_AUTH_CONTENT, and any auth.json opencode writes is removed.
 
+Every attempt is tagged with its owner, `<host>:<pid>` of this FAR process: a
+container through its labels, a local attempt through the FAR_CALL variable
+its processes inherit. Stopping, cleanup, and recovery act only on processes
+proven to be an attempt's (see `_members`), so they reach tools that left the
+process tree and never touch anything else.
+
 The `[far]` lines in an attempt's output log are written by this side, not by
 opencode.
 """
@@ -25,28 +31,23 @@ import subprocess
 import threading
 import time
 import uuid
-from contextlib import contextmanager
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import IO, Any
 
-from src.utils import PipelineCancelled
+import psutil
 
-ROOT = Path(__file__).resolve().parent.parent
-AGENTS_DIR = ROOT / "agents"
+AGENTS_DIR = Path(__file__).resolve().parent.parent / "agents"
 
-OPENCODE_VERSION = "1.18.32"
 # Docker's OpenCode sandbox template; 0.7.0 ships OpenCode 1.18.32.
-DOCKER_IMAGE = (
-    "docker/sandbox-templates:opencode-0.7.0"
-    "@sha256:b3b69aa5148a20d1c0e3ec4d5db2975b8b9d6830d46d50a93fd766aec7d6668b"
-)
-CONTAINER_HOME = "/home/agent"
+DOCKER_IMAGE = "docker/sandbox-templates:opencode-0.7.0"
 CONTAINER_WORKSPACE = "/workspace"
-
-# Bound on each step of winding an attempt down: stop, export, remove.
-FINISH_TIMEOUT = 120
-STOP_GRACE = 10
+# Containers run as the host user, who has no home in the image: the agent
+# gets one under its store, and the session data is mounted on its own. Both
+# live under /tmp, where that user can create them when nothing is mounted.
+CONTAINER_HOME = "/tmp/far/home"
+CONTAINER_DATA = "/tmp/far/data"
 
 # Pinned behaviour in both modes: no self-update, no external plugins, and no
 # project or Claude Code configuration picked up from around the workspace.
@@ -58,6 +59,18 @@ OPENCODE_ENV = {
 }
 # Workspace snapshots would track the enclosing git repository, not the task.
 BASE_CONFIG = {"snapshot": False}
+
+TAG_VAR = "FAR_CALL"
+
+
+def process_owner() -> str:
+    return f"{socket.gethostname()}:{os.getpid()}"
+
+
+def owner_gone(owner: str) -> bool:
+    """True for an owner on this host whose process has exited."""
+    host, _, pid = owner.rpartition(":")
+    return host == socket.gethostname() and pid.isdigit() and not pid_alive(int(pid))
 
 
 # ── Logging and session export, shared by both runtimes ─────────────────────
@@ -121,13 +134,28 @@ def _user_provider_config(provider: str) -> dict[str, Any] | None:
     return None
 
 
-def provider_env(model_id: str, container: bool) -> dict[str, str]:
-    """Environment carrying only the selected provider's credentials and config.
+def agent_definitions() -> dict[str, dict[str, Any]]:
+    """The agents in opencode's own config schema, each with its prompt filled in.
 
-    The stored login for that provider goes in OPENCODE_AUTH_CONTENT. A local
-    run already inherits the user's environment and global config; a container
-    additionally gets the provider's section of that config and its
-    `<PROVIDER>_API_KEY` / `<PROVIDER>_BASE_URL` variables.
+    agents/agents.json holds everything but the prompts, exactly as opencode's
+    `agent` config takes it; each agent's prompt is the text of agents/<name>.md.
+    """
+    agents = json.loads((AGENTS_DIR / "agents.json").read_text(encoding="utf-8"))
+    return {
+        name: {**agent, "prompt": (AGENTS_DIR / f"{name}.md").read_text(encoding="utf-8").strip()}
+        for name, agent in agents.items()
+    }
+
+
+def opencode_env(model_id: str, container: bool) -> dict[str, str]:
+    """The agents, the pinned settings, and only the selected provider's credentials.
+
+    Everything opencode is configured with travels in OPENCODE_CONFIG_CONTENT,
+    the same way in both modes: the agent definitions, BASE_CONFIG, and for a
+    container the provider's section of the user's global config. The stored
+    login for that provider goes in OPENCODE_AUTH_CONTENT. A local run already
+    inherits the user's environment; a container additionally gets the
+    provider's `<PROVIDER>_API_KEY` / `<PROVIDER>_BASE_URL` variables.
     """
     provider = model_id.split("/", 1)[0]
     env: dict[str, str] = {}
@@ -139,7 +167,7 @@ def provider_env(model_id: str, container: bool) -> dict[str, str]:
             entry = None
         if entry:
             env["OPENCODE_AUTH_CONTENT"] = json.dumps({provider: entry})
-    config: dict[str, Any] = dict(BASE_CONFIG)
+    config: dict[str, Any] = {**BASE_CONFIG, "agent": agent_definitions()}
     if container:
         section = _user_provider_config(provider)
         names = {f"{provider.upper().replace('-', '_')}_{suffix}" for suffix in ("API_KEY", "BASE_URL")}
@@ -161,18 +189,17 @@ class Call:
 
     proc: subprocess.Popen
     state: Path
+    tag: str = ""
     container: str = ""
-    env: dict[str, str] = field(default_factory=dict)
-    groups: set[int] = field(default_factory=set)
-    last_scan: float = 0
+    # Local only: every descendant seen while the attempt ran, by pid and
+    # creation time, so a pid taken over by another process is not mistaken.
+    seen: dict[int, float] = field(default_factory=dict)
 
 
-def _run(command: list[str], timeout: float = FINISH_TIMEOUT, **kwargs) -> subprocess.CompletedProcess:
+def _run(command: list[str], **kwargs) -> subprocess.CompletedProcess:
     # A new session keeps the terminal's Ctrl-C away from the bookkeeping
     # commands that are winding an attempt down.
-    return subprocess.run(
-        command, stdin=subprocess.DEVNULL, capture_output=True, timeout=timeout, start_new_session=True, **kwargs
-    )
+    return subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True, start_new_session=True, **kwargs)
 
 
 def _popen(command: list[str], **kwargs) -> subprocess.Popen:
@@ -186,127 +213,162 @@ def _popen(command: list[str], **kwargs) -> subprocess.Popen:
     )
 
 
-def _process_groups(root: int) -> set[int]:
-    """Process groups of `root` and all its descendants.
+def pid_alive(pid: int) -> bool:
+    return psutil.pid_exists(pid)
 
-    Tool commands may start their own groups; collect them while the tree is
-    still connected, before the parent dies and they are re-parented.
+
+# ── Which local processes belong to an attempt ──────────────────────────────
+
+
+@dataclass
+class _Proc:
+    ppid: int
+    created: float
+    pgid: int
+    tag: str | None
+
+
+_table_lock = threading.Lock()
+_table_cache: tuple[float, dict[int, _Proc]] = (0.0, {})
+
+
+def _table(max_age: float = 0.0) -> dict[int, _Proc]:
+    """This user's live processes. Attempts side by side share one listing up to `max_age` old.
+
+    The tag is None where it cannot be read: macOS hides the environment of
+    its own binaries (sh, sleep, ...).
     """
-    try:
-        rows = subprocess.run(["ps", "-A", "-o", "pid=,ppid=,pgid="], capture_output=True, text=True).stdout
-    except OSError:
-        return {root}
-    children: dict[int, list[tuple[int, int]]] = {}
-    for line in rows.splitlines():
-        parts = line.split()
-        if len(parts) == 3:
-            pid, ppid, pgid = map(int, parts)
-            children.setdefault(ppid, []).append((pid, pgid))
-    groups, stack = {root}, [root]
+    global _table_cache
+    with _table_lock:
+        taken, table = _table_cache
+        if time.monotonic() - taken > max_age:
+            table = {}
+            me, mine = os.getpid(), os.getpgid(0)
+            for proc in psutil.process_iter(["ppid", "create_time", "status", "uids"]):
+                info = proc.info
+                if proc.pid == me or info["status"] == psutil.STATUS_ZOMBIE or not info["uids"]:
+                    continue
+                if info["uids"].real != os.getuid():
+                    continue
+                try:
+                    pgid = os.getpgid(proc.pid)
+                except OSError:
+                    continue  # exited meanwhile
+                try:
+                    tag = proc.environ().get(TAG_VAR)
+                except psutil.Error:
+                    tag = None
+                if pgid == mine:
+                    continue  # never this FAR process or anything in its group
+                table[proc.pid] = _Proc(info["ppid"], info["create_time"], pgid, tag)
+            _table_cache = (time.monotonic(), table)
+        return table
+
+
+def _observe(call: Call) -> None:
+    """Record the attempt's current descendants, while the tree is connected."""
+    table = _table(max_age=1.0)
+    children: dict[int, list[int]] = {}
+    for pid, proc in table.items():
+        children.setdefault(proc.ppid, []).append(pid)
+    stack = [call.proc.pid]
     while stack:
-        for pid, pgid in children.get(stack.pop(), []):
-            groups.add(pgid)
-            stack.append(pid)
-    groups.discard(os.getpgid(0))
-    return groups
+        for child in children.get(stack.pop(), []):
+            call.seen[child] = table[child].created
+            stack.append(child)
 
 
-def _signal_groups(groups: set[int], sig: int) -> None:
-    for group in groups:
+def _members(match: Callable[[str], bool], calls: list[Call] = ()) -> set[int]:
+    """Live processes proven to belong to the matching attempts.
+
+    Proof is one of: a matching FAR_CALL tag, a descendant seen with the same
+    creation time, or a call's own opencode process not yet reaped. Then the
+    descendants of a proven process, and the processes in its group, belong
+    too: that reaches the tools whose tag macOS will not show.
+    """
+    table = _table()
+    own = {pid for pid, proc in table.items() if proc.tag is not None and match(proc.tag)}
+    for call in calls:
+        own |= {pid for pid, created in call.seen.items() if pid in table and table[pid].created == created}
+        if call.proc.returncode is None and call.proc.pid in table:
+            own.add(call.proc.pid)
+    while True:
+        groups = {table[pid].pgid for pid in own}
+        more = {pid for pid, proc in table.items() if pid not in own and (proc.ppid in own or proc.pgid in groups)}
+        if not more:
+            return own
+        own |= more
+
+
+def _signal(pids: set[int], sig: int) -> None:
+    for pid in pids:
         try:
-            os.killpg(group, sig)
+            os.kill(pid, sig)
         except (ProcessLookupError, PermissionError):
             pass
-
-
-def _wait(proc: subprocess.Popen, timeout: float) -> bool:
-    try:
-        proc.wait(timeout=timeout)
-        return True
-    except subprocess.TimeoutExpired:
-        return False
-
-
-def pid_alive(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    return True
 
 
 # ── Local ───────────────────────────────────────────────────────────────────
 
 
 class LocalRuntime:
-    """opencode on this machine, one process group per attempt."""
+    """opencode on this machine, its processes tagged per attempt."""
 
     mode = "local"
 
-    def __init__(self, work_root: Path) -> None:
-        # opencode writes package files into its config directory, so point it
-        # at a directory of its own that links to the repository's agents.
-        self.config_dir = work_root / ".opencode"
-        self.config_dir.mkdir(parents=True, exist_ok=True)
-        link = self.config_dir / "agents"
-        if not link.is_symlink():
-            try:
-                link.symlink_to(AGENTS_DIR, target_is_directory=True)
-            except FileExistsError:
-                pass
-
-    def preflight(self) -> None:
-        if shutil.which("opencode") is None:
-            raise SystemExit(
-                "opencode executable not found on PATH; install opencode or update PATH "
-                "before running the solve, judge, or grade stages."
-            )
-        version = _run(["opencode", "--version"], timeout=60, text=True).stdout.strip()
-        if version != OPENCODE_VERSION:
-            raise SystemExit(f"opencode {OPENCODE_VERSION} is required, found {version or 'unknown'}.")
+    def __init__(self) -> None:
+        self.owner = process_owner()
+        # Attempts between start and cleanup, for kill_all.
+        self.active: dict[str, Call] = {}
 
     def recover(self) -> None:
-        """Local attempts leave nothing behind but their store, which is kept."""
+        """Stop processes a dead FAR process on this host left running.
+
+        Their stores are kept; the sessions in them can be exported by hand.
+        """
+
+        def orphaned(tag: str) -> bool:
+            return owner_gone(tag.rpartition(":")[0])
+
+        left = _members(orphaned)
+        if left:
+            print(f"[local] stopping {len(left)} agent processes left by a dead FAR process", flush=True)
+            _signal(left, signal.SIGKILL)
 
     def path(self, workspace_file: Path) -> str:
         return str(workspace_file)
-
-    @contextmanager
-    def slot(self, stop_event: threading.Event | None):
-        yield
 
     def _env(self, state: Path) -> dict[str, str]:
         return {
             **os.environ,
             **OPENCODE_ENV,
-            "OPENCODE_CONFIG_DIR": str(self.config_dir),
             "XDG_DATA_HOME": str(state),
             "XDG_STATE_HOME": str(state / "state"),
         }
 
     def start(self, argv: list[str], workspace: Path, state: Path, inputs: list[Path], model_id: str, log) -> Call:
-        env = {**self._env(state), **provider_env(model_id, container=False)}
+        tag = f"{self.owner}:{uuid.uuid4().hex[:12]}"
+        env = {
+            **self._env(state),
+            **opencode_env(model_id, container=False),
+            TAG_VAR: tag,
+            # opencode takes its directory, and so its tools' cwd, from PWD.
+            "PWD": str(workspace),
+        }
         host_log(log, f"local opencode in {workspace}")
-        return Call(_popen(argv, cwd=workspace, env=env), state, env=env)
+        call = Call(_popen(argv, cwd=workspace, env=env), state, tag=tag)
+        self.active[tag] = call
+        return call
 
     def stop(self, call: Call) -> None:
-        groups = call.groups | _process_groups(call.proc.pid)
-        _signal_groups(groups, signal.SIGTERM)
-        _wait(call.proc, STOP_GRACE)
-        # Tools in their own process groups may survive after the parent has
-        # already exited; do not make their cleanup depend on the parent.
-        _signal_groups(groups | _process_groups(call.proc.pid), signal.SIGKILL)
-        if call.proc.poll() is None:
-            _wait(call.proc, STOP_GRACE)
+        _signal(_members(lambda tag: tag == call.tag, [call]), signal.SIGKILL)
+        call.proc.wait()
 
     def poll(self, call: Call) -> int | None:
-        now = time.monotonic()
-        if now - call.last_scan >= 1:
-            call.groups.update(_process_groups(call.proc.pid))
-            call.last_scan = now
-        return call.proc.poll()
+        code = call.proc.poll()
+        if code is None:
+            _observe(call)
+        return code
 
     def status(self, call: Call) -> tuple[int, str]:
         return call.proc.wait(), ""
@@ -315,94 +377,80 @@ class LocalRuntime:
         with open(export_path(state), "wb") as out:
             result = subprocess.run(
                 ["opencode", "export", session_id], cwd=state, env=self._env(state), stdin=subprocess.DEVNULL,
-                stdout=out, stderr=subprocess.PIPE, timeout=FINISH_TIMEOUT, start_new_session=True,
+                stdout=out, stderr=subprocess.PIPE, start_new_session=True,
             )  # fmt: skip
         if result.returncode != 0:
             raise RuntimeError(result.stderr.decode(errors="replace") or f"exit {result.returncode}")
 
     def cleanup(self, call: Call) -> None:
         # Whatever the agent left running in the background goes with it.
-        _signal_groups(call.groups | _process_groups(call.proc.pid), signal.SIGKILL)
+        _signal(_members(lambda tag: tag == call.tag, [call]), signal.SIGKILL)
+        self.active.pop(call.tag, None)
         remove_auth(call.state)
+
+    def kill_all(self) -> None:
+        """Kill every agent process this FAR process started, at once."""
+        mine = f"{self.owner}:"
+        _signal(_members(lambda tag: tag.startswith(mine), list(self.active.values())), signal.SIGKILL)
 
 
 # ── Docker ──────────────────────────────────────────────────────────────────
 
 
 class DockerRuntime:
-    """opencode in a fresh container per attempt.
-
-    `jobs` bounds the containers alive at once across all stages. An attempt
-    holds its slot from `docker create` to `docker rm`, including the helper
-    container that exports its session, so winding down never waits for a slot.
-    """
+    """opencode in a fresh container per attempt, run as the host user."""
 
     mode = "docker"
 
-    def __init__(self, jobs: int, cpus: str, memory: str, pids: int = 1024) -> None:
-        self.budget = threading.BoundedSemaphore(max(jobs, 1))
+    def __init__(self, cpus: str, memory: str, pids: int = 1024) -> None:
         self.limits = ["--cpus", cpus, "--memory", memory, "--memory-swap", memory, "--pids-limit", str(pids)]
-        self.owner = f"{socket.gethostname()}:{os.getpid()}"
-
-    def preflight(self) -> None:
-        try:
-            server = _run(["docker", "version", "--format", "{{.Server.Version}}"], timeout=30, text=True)
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            raise SystemExit(f"--mode docker needs a running Docker daemon: {exc}")
-        if server.returncode != 0:
-            raise SystemExit(f"--mode docker needs a running Docker daemon: {server.stderr.strip()}")
-        if _run(["docker", "image", "inspect", DOCKER_IMAGE], timeout=30).returncode != 0:
-            raise SystemExit(f"Docker image missing; pull it first:\n    docker pull {DOCKER_IMAGE}")
-        version = _run(self._helper(["opencode", "--version"]), timeout=FINISH_TIMEOUT, text=True).stdout.strip()
-        if version != OPENCODE_VERSION:
-            raise SystemExit(f"{DOCKER_IMAGE} should carry opencode {OPENCODE_VERSION}, found {version or 'unknown'}.")
+        self.owner = process_owner()
+        # Files the agent writes stay the host user's, so the next attempt can
+        # rebuild its workspace on any host.
+        self.user = ["--user", f"{os.getuid()}:{os.getgid()}"]
 
     def path(self, workspace_file: Path) -> str:
         return f"{CONTAINER_WORKSPACE}/{workspace_file.name}"
 
-    @contextmanager
-    def slot(self, stop_event: threading.Event | None):
-        while not self.budget.acquire(timeout=0.5):
-            if stop_event is not None and stop_event.is_set():
-                raise PipelineCancelled("pipeline cancelled")
-        try:
-            yield
-        finally:
-            self.budget.release()
+    def _env_args(self, home: str) -> list[str]:
+        env = {**OPENCODE_ENV, "HOME": home, "XDG_DATA_HOME": CONTAINER_DATA}
+        return [arg for k, v in env.items() for arg in ("-e", f"{k}={v}")]
 
     def _helper(self, command: list[str], mounts: list[str] = ()) -> list[str]:
         """A short-lived container with no network, for work that calls no model."""
         return [
-            "docker", "run", "--rm", "--pull", "never", "--network", "none",
-            "--name", f"far-helper-{uuid.uuid4().hex[:12]}", "--label", f"far.helper={self.owner}",
-            "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
-            *mounts, *[arg for k, v in OPENCODE_ENV.items() for arg in ("-e", f"{k}={v}")],
+            "docker", "run", "--rm", "--network", "none",
+            "--cap-drop", "ALL", "--security-opt", "no-new-privileges", *self.user,
+            *mounts, *self._env_args("/tmp"),
             DOCKER_IMAGE, *command,
         ]  # fmt: skip
 
     def start(self, argv: list[str], workspace: Path, state: Path, inputs: list[Path], model_id: str, log) -> Call:
         data = state / "opencode"
-        data.mkdir(parents=True, exist_ok=True)
-        secrets = provider_env(model_id, container=True)
+        home = state / "home"
+        # Made here, as the host user: Docker would make them as root.
+        for path in (data, home):
+            path.mkdir(parents=True, exist_ok=True)
+        secrets = opencode_env(model_id, container=True)
         mounts = ["-v", f"{workspace}:{CONTAINER_WORKSPACE}"]
         for path in inputs:
             mounts += ["-v", f"{workspace / path.name}:{self.path(path)}:ro"]
         mounts += [
-            "-v", f"{AGENTS_DIR}:{CONTAINER_HOME}/.config/opencode/agents:ro",
-            "-v", f"{data}:{CONTAINER_HOME}/.local/share/opencode",
+            "-v", f"{home}:{CONTAINER_HOME}",
+            "-v", f"{data}:{CONTAINER_DATA}/opencode",
         ]  # fmt: skip
         command = [
-            "docker", "create", "--pull", "never",
+            "docker", "create",
             "--label", f"far.owner={self.owner}", "--label", f"far.log={log.name}", "--label", f"far.state={state}",
-            "--cap-drop", "ALL", "--security-opt", "no-new-privileges", *self.limits,
-            "-w", CONTAINER_WORKSPACE, *mounts,
-            *[arg for k, v in OPENCODE_ENV.items() for arg in ("-e", f"{k}={v}")],
+            "--cap-drop", "ALL", "--security-opt", "no-new-privileges", *self.user, *self.limits,
+            "-w", CONTAINER_WORKSPACE, *mounts, *self._env_args(CONTAINER_HOME),
             # Names only: docker reads the values from its own environment, so
-            # they never appear on a command line.
+            # they stay off the command line. `docker inspect` still shows them
+            # while the container exists; it is removed when the attempt ends.
             *[arg for name in secrets for arg in ("-e", name)],
             DOCKER_IMAGE, *argv,
         ]  # fmt: skip
-        created = _run(command, timeout=FINISH_TIMEOUT, env={**os.environ, **secrets}, text=True)
+        created = _run(command, env={**os.environ, **secrets}, text=True)
         if created.returncode != 0:
             raise RuntimeError(f"docker create failed: {created.stderr.strip()}")
         container = created.stdout.strip()
@@ -418,15 +466,8 @@ class DockerRuntime:
 
     def stop(self, call: Call) -> None:
         if call.container:
-            try:
-                stopped = _run(["docker", "stop", "-t", str(STOP_GRACE), call.container])
-                if stopped.returncode != 0:
-                    _run(["docker", "kill", call.container], timeout=30)
-            except subprocess.TimeoutExpired:
-                _run(["docker", "kill", call.container], timeout=30)
-        if not _wait(call.proc, STOP_GRACE):
-            call.proc.kill()
-            call.proc.wait()
+            _run(["docker", "kill", call.container])
+        call.proc.wait()
 
     def status(self, call: Call) -> tuple[int, str]:
         call.proc.wait()
@@ -441,26 +482,28 @@ class DockerRuntime:
         return int(code), "container OOM-killed" if oom == "true" else ""
 
     def export(self, state: Path, session_id: str) -> None:
-        data = f"{CONTAINER_HOME}/.local/share/opencode"
-        mount = ["-v", f"{state / 'opencode'}:{data}"]
-        target = f"{data}/{export_path(state).name}"
+        mount = ["-v", f"{state / 'opencode'}:{CONTAINER_DATA}/opencode"]
+        target = f"{CONTAINER_DATA}/opencode/{export_path(state).name}"
         command = self._helper(["sh", "-c", 'opencode export "$1" > "$2"', "sh", session_id, target], mount)
-        try:
-            result = _run(command)
-        except subprocess.TimeoutExpired:
-            _run(["docker", "rm", "-f", command[command.index("--name") + 1]], timeout=30)
-            raise
+        result = _run(command)
         if result.returncode != 0:
             raise RuntimeError(result.stderr.decode(errors="replace") or f"exit {result.returncode}")
 
     def cleanup(self, call: Call) -> None:
         try:
             if call.container:
-                result = _run(["docker", "rm", "-f", call.container], timeout=FINISH_TIMEOUT)
+                result = _run(["docker", "rm", "-f", call.container])
                 if result.returncode:
                     raise RuntimeError(result.stderr.decode(errors="replace").strip())
         finally:
             remove_auth(call.state)
+            shutil.rmtree(call.state / "home", ignore_errors=True)
+
+    def kill_all(self) -> None:
+        """Kill every container this FAR process started; recover() finishes them."""
+        listed = _run(["docker", "ps", "-q", "--filter", f"label=far.owner={self.owner}"], text=True)
+        if listed.stdout.split():
+            _run(["docker", "kill", *listed.stdout.split()])
 
     def recover(self) -> None:
         """Wind down containers a dead FAR process on this host left behind.
@@ -469,29 +512,34 @@ class DockerRuntime:
         touched; a live owner, another host, or an unlabelled container is
         left alone. The output log gets the container's own log and the
         session is exported before the container is removed. The store on
-        the host is never deleted.
+        the host is never deleted. One container failing to recover does not
+        hold up the others or the run.
         """
         fmt = '{{.ID}}\t{{.Label "far.owner"}}\t{{.Label "far.log"}}\t{{.Label "far.state"}}'
-        listed = _run(["docker", "ps", "-a", "--filter", "label=far.owner", "--format", fmt], timeout=60, text=True)
-        host = socket.gethostname()
+        listed = _run(["docker", "ps", "-a", "--filter", "label=far.owner", "--format", fmt], text=True)
         for row in listed.stdout.splitlines():
             container, owner, log_name, state = (row.split("\t") + ["", "", ""])[:4]
-            owner_host, _, pid = owner.rpartition(":")
-            if owner_host != host or not pid.isdigit() or pid_alive(int(pid)) or not log_name:
+            if not owner_gone(owner) or not log_name:
                 continue
-            log_path, state_path = Path(log_name), Path(state)
-            print(f"[docker] recovering container {container} left by process {pid}", flush=True)
-            _run(["docker", "stop", "-t", str(STOP_GRACE), container])
-            with open(log_path, "ab", buffering=0) as log:
-                host_log(log, f"recovering container {container} left by dead process {pid}; its log follows")
-                logs = _run(["docker", "logs", container])
-                log.write(logs.stdout + logs.stderr)
-                code, oom = self._exit_state(container, None)
-                host_log(log, f"recovered container exit code {code} {oom}".rstrip())
-                session_path = log_path.with_name(log_path.name.replace("output_", "session_")).with_suffix(".json")
-                save_session(self, state_path, session_id_in(log_path), session_path, log)
-                _run(["docker", "rm", "-f", container])
-                remove_auth(state_path)
+            print(f"[docker] recovering container {container} left by {owner}", flush=True)
+            try:
+                self._recover_one(container, owner, Path(log_name), Path(state))
+            except Exception as exc:  # noqa: BLE001 - recover the rest, keep this one for a later run
+                print(f"[docker] could not recover {container}: {exc}", flush=True)
+
+    def _recover_one(self, container: str, owner: str, log_path: Path, state_path: Path) -> None:
+        _run(["docker", "kill", container])
+        with open(log_path, "ab", buffering=0) as log:
+            host_log(log, f"recovering container {container} left by dead process {owner}; its log follows")
+            logs = _run(["docker", "logs", container])
+            log.write(logs.stdout + logs.stderr)
+            code, oom = self._exit_state(container, None)
+            host_log(log, f"recovered container exit code {code} {oom}".rstrip())
+            session_path = log_path.with_name(log_path.name.replace("output_", "session_")).with_suffix(".json")
+            save_session(self, state_path, session_id_in(log_path), session_path, log)
+        _run(["docker", "rm", "-f", container])
+        remove_auth(state_path)
+        shutil.rmtree(state_path / "home", ignore_errors=True)
 
 
 def session_id_in(log_path: Path) -> str | None:
@@ -501,12 +549,13 @@ def session_id_in(log_path: Path) -> str | None:
             start = line.find(marker)
             if start >= 0:
                 start += len(marker)
-                return line[start : line.index(b'"', start)].decode()
+                end = line.find(b'"', start)
+                if end > start:
+                    return line[start:end].decode(errors="replace")
     return None
 
 
 def make_runtime(args) -> "LocalRuntime | DockerRuntime":
-    work_root = Path(args.work_root).expanduser().resolve()
     if args.mode == "docker":
-        return DockerRuntime(jobs=8, cpus="2", memory="4g")
-    return LocalRuntime(work_root)
+        return DockerRuntime(cpus="2", memory="4g")
+    return LocalRuntime()

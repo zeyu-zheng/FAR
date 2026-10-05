@@ -236,11 +236,15 @@ def reset_workspace(stage_dir: Path, inputs: list[Path]) -> Path:
     """Empty the workspace and copy in this stage's inputs, read-only."""
     workspace = stage_dir / "workspace"
     if workspace.exists():
-        def writable(func, path, _exc):
-            os.chmod(path, 0o700)
-            func(path)
-
-        shutil.rmtree(workspace, onerror=writable)
+        # The agent may have left directories it cannot write; open them up
+        # first. Links are not followed, so nothing outside is touched.
+        os.chmod(workspace, 0o700)
+        for root, dirs, _ in os.walk(workspace):
+            for name in dirs:
+                path = os.path.join(root, name)
+                if not os.path.islink(path):
+                    os.chmod(path, 0o700)
+        shutil.rmtree(workspace)
     workspace.mkdir(parents=True)
     for path in inputs:
         target = workspace / path.name
@@ -276,34 +280,45 @@ def run_attempt(
             command = opencode_command(
                 model_id, effort, agent, message, [runtime.path(workspace / path.name) for path in inputs]
             )
-            with runtime.slot(stop_event):
-                check_cancelled(stop_event)
-                call = runtime.start(command, workspace, state, inputs, model_id, log)
+            check_cancelled(stop_event)
+            call = runtime.start(command, workspace, state, inputs, model_id, log)
+            try:
+                cancelled = pump(runtime, call, log, output, stop_event)
+            finally:
+                cancelled = cancelled or (stop_event is not None and stop_event.is_set())
+                # Each step gets its own error handling: an inspection or
+                # cleanup error must not skip the available trajectory.
                 try:
-                    cancelled = pump(runtime, call, log, output, stop_event)
-                finally:
-                    cancelled = cancelled or (stop_event is not None and stop_event.is_set())
-                    # Each step gets its own error handling: an inspection or
-                    # cleanup error must not skip the available trajectory.
-                    try:
-                        if call.proc.poll() is None or cancelled:
-                            runtime.stop(call)
-                            pump(runtime, call, log, output, None, deadline=time.monotonic() + 5)
-                        code, problem = runtime.status(call)
-                    except Exception as exc:
-                        problem = f"finish failed: {exc}"
-                        host_log(log, problem)
-                    host_log(log, f"{'cancelled, ' if cancelled else ''}exit code {code} {problem}".rstrip())
-                    save_session(runtime, state, output.session_id, session_path, log)
-                    try:
-                        runtime.cleanup(call)
-                    except Exception as exc:
-                        host_log(log, f"cleanup failed: {exc}; resources may need recovery")
+                    if call.proc.poll() is None or cancelled:
+                        runtime.stop(call)
+                        pump(runtime, call, log, output, None, deadline=time.monotonic() + 5)
+                    code, problem = runtime.status(call)
+                except Exception as exc:
+                    problem = f"finish failed: {exc}"
+                    host_log(log, problem)
+                host_log(log, f"{'cancelled, ' if cancelled else ''}exit code {code} {problem}".rstrip())
+                save_session(runtime, state, output.session_id, session_path, log)
+                try:
+                    runtime.cleanup(call)
+                except Exception as exc:
+                    host_log(log, f"cleanup failed: {exc}; resources may need recovery")
         except Exception as exc:
             host_log(log, f"{type(exc).__name__}: {exc}")
             raise
-    if cancelled:
-        raise PipelineCancelled("pipeline cancelled")
+        if cancelled:
+            raise PipelineCancelled("pipeline cancelled")
+        try:
+            return final_text(output, code, problem, expected_first_words, log_path)
+        except RuntimeError as exc:
+            # Recorded in this attempt's log, so a retry's reason is not lost.
+            host_log(log, f"rejected: {exc}")
+            raise
+
+
+def final_text(
+    output: OpencodeOutput, code: int, problem: str, expected_first_words: set[str], log_path: Path
+) -> str:
+    """The agent's answer, or why the attempt does not count."""
     if code != 0 or problem:
         details = " | ".join(output.tail)[-2000:]
         raise RuntimeError(f"opencode exited with {code}{', ' + problem if problem else ''} ({log_path}): {details}")
