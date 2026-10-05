@@ -78,10 +78,10 @@ async def check_row(
         }
         results.append(result)
         if checkpoint_path is not None:
-            append_checkpoint(checkpoint_path, result)
+            append_jsonl(checkpoint_path, result)
 
     if checkpoint_path is not None:
-        clear_checkpoint(checkpoint_path)
+        checkpoint_path.unlink(missing_ok=True)
     results.sort(key=lambda item: (item["status"] != "open", -item["importance"], item["difficulty"]))
     return {
         **header,
@@ -113,16 +113,6 @@ def checkpoint_path_for(data_dir: Path, row_index: int) -> Path:
 def load_checkpoint(path: Path) -> dict[int, dict[str, Any]]:
     """The candidates already done for one paper, by candidate index."""
     return {int(item["candidate_index"]): item for item in iter_jsonl(path)}
-
-
-def append_checkpoint(path: Path, candidate: dict[str, Any]) -> None:
-    # Only this paper's worker writes here, but append_jsonl also creates the
-    # directory and keeps the write whole.
-    append_jsonl(path, candidate)
-
-
-def clear_checkpoint(path: Path) -> None:
-    path.unlink(missing_ok=True)
 
 
 # ── Pool ────────────────────────────────────────────────────────────────────

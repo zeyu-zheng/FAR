@@ -152,7 +152,7 @@ def put_item(out_queue: "queue.Queue | None", item: Any, stop_event: threading.E
 
 def run_pool(
     tasks: Iterable[Any],
-    submit: Callable[[ThreadPoolExecutor, Any], concurrent.futures.Future],
+    work: Callable[[Any], Any],
     handle_done: Callable[[concurrent.futures.Future], None],
     jobs: int,
     ramp_delay: float,
@@ -207,7 +207,7 @@ def run_pool(
                     break
                 if ramp_delay and launched and launched < jobs:
                     time.sleep(ramp_delay)
-                pending.add(submit(executor, task))
+                pending.add(executor.submit(work, task))
                 launched += 1
 
             if pending:
@@ -361,9 +361,6 @@ def drive(
     if ctx.args.limit is not None:
         tasks = itertools.islice(tasks, ctx.args.limit)
 
-    def submit(executor, task):
-        return executor.submit(work, task)
-
     def handle_done(future):
         item = future.result()
         if item is None:
@@ -377,7 +374,7 @@ def drive(
         ctx.stats.report()
 
     try:
-        run_pool(tasks, submit, handle_done, jobs, ramp, ctx.stop_event)
+        run_pool(tasks, work, handle_done, jobs, ramp, ctx.stop_event)
     except BaseException:
         ctx.stop_event.set()
         raise
@@ -456,8 +453,7 @@ def run_extract(ctx: Context, in_queue, out_queue) -> None:
         row_index = row.get("row_index")
 
         def once():
-            item = extract_stage.process_row(row, ctx.body(row), client)
-            return {**item, "row_index": row_index}
+            return extract_stage.process_row(row, ctx.body(row), client)
 
         return ctx.retrying("extract", row_index, once)
 
@@ -555,7 +551,7 @@ def run_grade(ctx: Context, in_queue, out_queue) -> None:
         return ctx.retrying("grade", result_key(item), once)
 
     def forward(item):
-        ctx.stats.bump("grade", str(item.get("quality") or "ungraded"))
+        ctx.stats.bump("grade", item["quality"])
         if grade_stage.is_artifact(item):
             ctx.stats.bump("grade", "artifact")
         return []
